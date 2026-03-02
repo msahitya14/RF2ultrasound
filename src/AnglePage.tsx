@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react"
+import NoSleep from "nosleep.js"
 
 export default function AnglePage() {
   const [beta, setBeta] = useState(0)
@@ -13,6 +14,7 @@ export default function AnglePage() {
   const socketRef = useRef<WebSocket | null>(null)
   const lastBeta = useRef(0)
   const lastGamma = useRef(0)
+  const noSleepRef = useRef<NoSleep | null>(null)
 
   // Request iOS permissions
   const requestPermission = async () => {
@@ -57,12 +59,20 @@ export default function AnglePage() {
         lastGamma.current = event.gamma
         setBeta(event.beta)
         setGamma(event.gamma)
+
+        // Only send angles if calibrated and WS open
+        if (calibrated && socketRef.current?.readyState === WebSocket.OPEN) {
+          const x = event.beta - baseBeta
+          const y = event.gamma - baseGamma
+          socketRef.current.send(JSON.stringify({ type: "angles", x, y }))
+          setLastPayload({ x, y })
+        }
       }
     }
 
     window.addEventListener("deviceorientation", handleOrientation, true)
     return () => window.removeEventListener("deviceorientation", handleOrientation, true)
-  }, [permissionGranted])
+  }, [permissionGranted, calibrated, baseBeta, baseGamma])
 
   // WebSocket connection
   useEffect(() => {
@@ -74,9 +84,18 @@ export default function AnglePage() {
       const wsUrl = `${window.location.origin.replace(/^http/, "ws")}/ws`
       ws = new WebSocket(wsUrl)
 
-      ws.onopen = () => setWsStatus("Connected")
-      ws.onerror = () => setWsStatus("Error")
+      ws.onopen = () => {
+        console.log("WebSocket connected")
+        setWsStatus("Connected")
+      }
+
+      ws.onerror = (err) => {
+        console.error("WebSocket error", err)
+        setWsStatus("Error")
+      }
+
       ws.onclose = () => {
+        console.log("WebSocket disconnected")
         setWsStatus("Disconnected")
         reconnectTimeout = setTimeout(connect, 2000)
       }
@@ -85,53 +104,38 @@ export default function AnglePage() {
     }
 
     connect()
+
     return () => {
       ws?.close()
       clearTimeout(reconnectTimeout)
     }
   }, [])
 
-  // Calibrate
+  // Calibrate button
   const calibrate = () => {
     setBaseBeta(lastBeta.current)
     setBaseGamma(lastGamma.current)
     setCalibrated(true)
+
+    console.log("Calibrated at:", lastBeta.current, lastGamma.current)
+
+    // Keep the screen awake
+    if (!noSleepRef.current) {
+      noSleepRef.current = new NoSleep()
+    }
+    noSleepRef.current.enable()
 
     if (socketRef.current?.readyState === WebSocket.OPEN) {
       socketRef.current.send(JSON.stringify({ type: "calibrate" }))
     }
   }
 
-  const relX = calibrated ? lastBeta.current - baseBeta : 0
-  const relY = calibrated ? lastGamma.current - baseGamma : 0
+  // Compute relative angles
+  const relX = calibrated ? beta - baseBeta : 0
+  const relY = calibrated ? gamma - baseGamma : 0
 
-  // Send angles
-useEffect(() => {
-  if (!calibrated) return
-
-  const interval = setInterval(() => {
-    if (socketRef.current?.readyState === WebSocket.OPEN) {
-      const x = lastBeta.current - baseBeta
-      const y = lastGamma.current - baseGamma
-
-      const payload = { type: "angles", x, y }
-
-      socketRef.current.send(JSON.stringify(payload))
-      setLastPayload({ x, y })
-
-      console.log("Sending:", payload)
-    }
-  }, 50)
-
-  return () => clearInterval(interval)
-}, [calibrated, baseBeta, baseGamma])
   return (
-    <div
-      onClick={() => {
-        if (permissionGranted) calibrate()
-      }}
-      style={{ padding: 20, fontFamily: "sans-serif", minHeight: "100vh" }}
-    >
+    <div style={{ padding: 20, fontFamily: "sans-serif", minHeight: "100vh" }}>
       <h1>Angle Tracker</h1>
 
       {!permissionGranted && (
@@ -142,24 +146,28 @@ useEffect(() => {
 
       {permissionGranted && (
         <>
+          <button
+            onClick={calibrate}
+            style={{ fontSize: 18, padding: 10, marginBottom: 20 }}
+          >
+            Calibrate
+          </button>
+
           <p>
             <strong>Beta:</strong> {beta.toFixed(2)}
           </p>
+
           <p>
             <strong>Gamma:</strong> {gamma.toFixed(2)}
           </p>
 
           <p>
-            <strong>Relative X:</strong> {relX.toFixed(2)} | <strong>Relative Y:</strong>{" "}
-            {relY.toFixed(2)}
+            <strong>Relative X:</strong> {relX.toFixed(2)} |{" "}
+            <strong>Relative Y:</strong> {relY.toFixed(2)}
           </p>
 
           <p>
             <strong>WebSocket Status:</strong> {wsStatus}
-          </p>
-
-          <p>
-            <strong>Tap anywhere to calibrate</strong> (sets x,y to 0,0)
           </p>
 
           {lastPayload && (
