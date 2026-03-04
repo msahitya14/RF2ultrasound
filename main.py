@@ -5,6 +5,12 @@ from scipy.interpolate import RegularGridInterpolator
 from scipy.ndimage import gaussian_filter
 import cv2
 import time
+from settings import (
+    center_freq,
+    fractional_bw,
+    sector_angle_deg,
+    curvature_radius_mm,
+)
 
 def anisotropic_diffusion(img, niter=5, kappa=30, gamma=0.1):
     """
@@ -156,10 +162,10 @@ if __name__ == "__main__":
     start_time = time.perf_counter()
     img = rf_to_convex_bmode_fixed(
         "ae2RF.txt",
-        center_freq=3e6,           # <-- SET THIS to your probe's center frequency
-        fractional_bw=0.6,
-        sector_angle_deg=70,
-        curvature_radius_mm=30,
+        center_freq=center_freq,           # <-- SET THIS to your probe's center frequency
+        fractional_bw=fractional_bw,
+        sector_angle_deg=sector_angle_deg,
+        curvature_radius_mm=curvature_radius_mm,
     )
     end_time = time.perf_counter()
     print(f"Total processing time: {end_time - start_time:.2f} seconds")
