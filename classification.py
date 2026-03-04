@@ -3,6 +3,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Subset, random_split
 from torchvision import datasets, transforms
+import torchvision.transforms as T
+
 
 # Convert rf_data to b-mode images
 # Needs rf_folder to have True and False folders for classes
@@ -12,7 +14,8 @@ def get_images(rf_folder):
 
 # TODO: adjust batch size to fit with 
 def get_loaders():
-    dataset = datasets.ImageFolder(root = "Data")
+    transform = T.ToTensor()
+    dataset = datasets.ImageFolder(root = "Data", transform= transform)
     train_size = int(0.8 * len(dataset))
     test_size = len(dataset) - train_size
     train_data, test_data = random_split(dataset, [train_size, test_size])
@@ -31,9 +34,9 @@ def patch_extraction(envelope, p_width, p_height, r_width, r_height):
 # May consider 2 channels: envelope and bmode
 class CNN(nn.Module):
     def __init__(self):
-        super().__init__(self)
+        super().__init__()
         self.layer1 = nn.Sequential(
-            nn.Conv2d(in_channels = 1, out_channels = 16, kernel_size = 3, padding = 1),
+            nn.Conv2d(in_channels = 3, out_channels = 16, kernel_size = 3, padding = 1),
             nn.ReLU(),
             nn.MaxPool2d(kernel_size = 2)
         )
@@ -42,13 +45,13 @@ class CNN(nn.Module):
             nn.ReLU(),
             nn.MaxPool2d(kernel_size = 2)
         )
-        self.classifier = nn.Linear(32, 1)
+        self.classifier = nn.LazyLinear(1)
         
     def forward(self, x):
         out = self.layer1(x)
         out = self.layer2(out)
         out = F.adaptive_avg_pool2d(out, (3, 3))
-        out = out.flatten(out, start_dim = 1)
+        out = torch.flatten(out,1)
         out = self.classifier(out)
         return out
 
@@ -60,38 +63,44 @@ class CNN(nn.Module):
 # @return average loss
 def train(model, dataloader, optimizer, criterion, device):
     model.train()
-    running_loss = 0.0
-    for image, label in dataloader:
-        image.to(device)
-        label.to(device)
-
-        optimizer.zero_grad()
-        logits = model(image)
-        loss = criterion(logits, label)
-
-        loss.backward()
-        optimizer.step()
-
-        running_loss += loss.item()
-    return running_loss/len(dataloader)
-
-# return accuracy of model
-def evaluate(model, dataloader, criterion, device):
+    correct = 0
+    samples = 0
     for images, labels in dataloader:
         images = images.to(device)
         labels = labels.to(device)
 
-        outputs = model(images)
-        loss = criterion(outputs, labels)
+        optimizer.zero_grad()
+        logits = model(images)
+        loss = criterion(logits, labels.float().unsqueeze(1))
 
-        total_loss += loss.item() * images.size(0)
-        predict = outputs.argmax(dim = 1)
+        loss.backward()
+        optimizer.step()
+
+        predict = (logits >= 0).long().squeeze(1)
         correct += (predict == labels).sum().item()
         samples += images.size(0)
     return correct/samples
 
+# return accuracy of model
+def evaluate(model, dataloader, criterion, device):
+    model.eval()
+    correct = 0
+    samples = 0
 
-def main(rf_folder):
+    with torch.no_grad():
+        for images, labels in dataloader:
+            images = images.to(device)
+            labels = labels.to(device)
+
+            logits = model(images)
+
+            predict = (logits >= 0).long().squeeze(1)
+            correct += (predict == labels).sum().item()
+            samples += images.size(0)
+    return correct/samples
+
+
+def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = CNN().to(device)
     criterion = nn.BCEWithLogitsLoss()
