@@ -50,4 +50,3 @@ This project serves a web app and WebSocket server for ultrasound angle guidance
 
 ---
 
-Feel free to update this README as your project evolves!
