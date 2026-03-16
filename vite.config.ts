@@ -12,8 +12,8 @@ export default defineConfig({
 		strictPort: true,
 		allowedHosts: true,
 		https: {
-			key: fs.readFileSync(path.resolve(__dirname, "localhost-key.pem")),
-			cert: fs.readFileSync(path.resolve(__dirname, "localhost-cert.pem")),
+			key: fs.readFileSync(path.resolve(__dirname, "10.8.183.109+2-key.pem")),
+			cert: fs.readFileSync(path.resolve(__dirname, "10.8.183.109+2.pem")),
 		},
 	},
 })
