@@ -1,5 +1,3 @@
-// vite.config.ts
-
 import { defineConfig } from "vite"
 import react from "@vitejs/plugin-react"
 import fs from "fs"
@@ -13,19 +11,12 @@ export default defineConfig({
 		strictPort: true,
 		allowedHosts: true,
 		https: {
-			key: fs.readFileSync(path.resolve(__dirname, "172.31.83.113+2-key.pem")),
-			cert: fs.readFileSync(path.resolve(__dirname, "172.31.83.113+2.pem")),
+			key: fs.readFileSync(path.resolve(__dirname, "10.8.227.137+2-key.pem")),
+			cert: fs.readFileSync(path.resolve(__dirname, "10.8.227.137+2.pem")),
 		},
 		proxy: {
-			"/ws": {
-				target: "https://172.31.83.113:3000",
-				ws: true,
-				secure: false,
-			},
-			"/angles": {
-				target: "https://172.31.83.113:3000",
-				secure: false,
-			},
+			"/ws": { target: "https://10.8.227.137:3000", ws: true, secure: false },
+			"/angles": { target: "https://10.8.227.137:3000", secure: false },
 		},
 	},
 })

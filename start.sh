@@ -1,3 +1,105 @@
+#!/bin/bash
+
+IP=$(ipconfig getifaddr en0)
+echo "📍 Detected IP: $IP"
+
+# Generate new cert for this IP
+mkcert "$IP" localhost 127.0.0.1
+
+# Kill anything on ports 3000 and 5173
+lsof -ti:3000 | xargs kill -9 2>/dev/null
+lsof -ti:5173 | xargs kill -9 2>/dev/null
+
+# Rewrite server.cjs with correct cert paths
+cat > server.cjs << EOF
+const express = require("express")
+const path = require("path")
+const https = require("https")
+const fs = require("fs")
+const WebSocket = require("ws")
+
+const app = express()
+
+const key  = fs.readFileSync(path.join(__dirname, "${IP}+2-key.pem"))
+const cert = fs.readFileSync(path.join(__dirname, "${IP}+2.pem"))
+
+const server = https.createServer({ key, cert }, app)
+
+const buildPath = path.join(__dirname, "dist")
+app.use(express.static(buildPath))
+app.use((req, res) => {
+	res.sendFile(path.join(buildPath, "index.html"))
+})
+
+const wss = new WebSocket.Server({ server, path: "/ws" })
+let latestAngles = { x: 0, y: 0, calibratedAt: null, updatedAt: null }
+
+wss.on("connection", (ws, req) => {
+	console.log("Client connected from:", req.socket.remoteAddress)
+
+	ws.on("message", msg => {
+		try {
+			const data = JSON.parse(msg)
+			if (data.type === "angles") {
+				latestAngles = {
+					x: data.x,
+					y: data.y,
+					calibratedAt: latestAngles.calibratedAt,
+					updatedAt: new Date().toISOString(),
+				}
+			} else if (data.type === "calibrate") {
+				latestAngles.calibratedAt = new Date().toISOString()
+			}
+			console.log("Received:", data)
+		} catch {
+			console.log("Invalid message:", msg)
+		}
+	})
+
+	ws.on("close", () => console.log("Client disconnected"))
+})
+
+app.get("/angles", (req, res) => {
+	res.json(latestAngles)
+})
+
+const HOST = "${IP}"
+const PORT = process.env.PORT || 3000
+
+server.listen(PORT, "0.0.0.0", () => {
+	console.log("Server running on https://\${HOST}:\${PORT}")
+	console.log("Angles endpoint: https://\${HOST}:\${PORT}/angles")
+})
+EOF
+
+# Rewrite vite.config.ts with correct cert paths and proxy target
+cat > vite.config.ts << EOF
+import { defineConfig } from "vite"
+import react from "@vitejs/plugin-react"
+import fs from "fs"
+import path from "path"
+
+export default defineConfig({
+	plugins: [react()],
+	server: {
+		host: true,
+		port: 5173,
+		strictPort: true,
+		allowedHosts: true,
+		https: {
+			key: fs.readFileSync(path.resolve(__dirname, "${IP}+2-key.pem")),
+			cert: fs.readFileSync(path.resolve(__dirname, "${IP}+2.pem")),
+		},
+		proxy: {
+			"/ws": { target: "https://${IP}:3000", ws: true, secure: false },
+			"/angles": { target: "https://${IP}:3000", secure: false },
+		},
+	},
+})
+EOF
+
+# Rewrite AnglePage.tsx with correct WebSocket IP
+cat > src/AnglePage.tsx << 'TSEOF'
 import { useEffect, useRef, useState } from "react"
 import NoSleep from "nosleep.js"
 
@@ -77,7 +179,7 @@ export default function AnglePage() {
     let timer: ReturnType<typeof setTimeout>
     const connect = () => {
       setWsStatus("connecting")
-      ws = new WebSocket(`wss://10.8.227.137:5173/ws`)
+      ws = new WebSocket(`wss://REPLACE_IP:5173/ws`)
       ws.onopen = () => setWsStatus("connected")
       ws.onerror = () => setWsStatus("error")
       ws.onclose = () => { setWsStatus("disconnected"); timer = setTimeout(connect, 2000) }
@@ -211,3 +313,15 @@ function btnStyle(active: boolean): React.CSSProperties {
     transition: "border-color 0.3s, color 0.3s",
   }
 }
+TSEOF
+
+# Now replace the REPLACE_IP placeholder with the actual IP
+sed -i '' "s|REPLACE_IP|${IP}|g" src/AnglePage.tsx
+
+echo "✅ Config updated for $IP"
+echo "📱 Open on phone: https://$IP:5173"
+echo ""
+echo "Starting servers..."
+
+node server.cjs &
+npx vite
