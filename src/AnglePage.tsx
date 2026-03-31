@@ -78,7 +78,7 @@ export default function AnglePage() {
     const connect = () => {
       setWsStatus("connecting")
       const proto = location.protocol === "https:" ? "wss" : "ws"
-      ws = new WebSocket(`${proto}://${location.hostname}:3000/ws`)
+      ws = new WebSocket(`${proto}://${location.hostname}:${location.port}/ws`)
       ws.onopen = () => setWsStatus("connected")
       ws.onerror = () => setWsStatus("error")
       ws.onclose = () => { setWsStatus("disconnected"); timer = setTimeout(connect, 2000) }
