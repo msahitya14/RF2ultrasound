@@ -24,34 +24,6 @@ def get_med_loaders(batch_size):
     test_loader = DataLoader(dataset=test_dataset, batch_size=2* batch_size, shuffle=False)
     return (train_loader, test_loader)
 
-
-
-# temporary loaders for cifar10, dogs and cats
-def get_cifar_loaders():
-    transform = transforms.ToTensor()
-
-    dataset = datasets.CIFAR10(
-        root="./pytorch_data",
-        train=True,
-        download=True,
-        transform=transform
-    )
-
-    # keep only cats (3) and dogs (5)
-    dataset = [
-        (img, 0 if label == 3 else 1)
-        for img, label in dataset
-        if label in [3, 5]
-    ]
-
-    train_size = int(0.8 * len(dataset))
-    test_size = len(dataset) - train_size
-    train_data, test_data = random_split(dataset, [train_size, test_size])
-
-    train_loader = DataLoader(train_data, batch_size = int(train_size/10), shuffle = True, download = True)
-    test_loader = DataLoader(test_data, batch_size = len(dataset) - int(train_size/10), shuffle = False, download = True)
-    return (train_loader, test_loader)
-
 # TODO: adjust batch size to fit 
 def get_loaders():
     transform = T.ToTensor()
@@ -93,8 +65,6 @@ class CNN(nn.Module):
             backbone.maxpool,
             backbone.layer1,   # ~256 channels
             backbone.layer2,   # ~512 channels
-            # backbone.layer3, # removed — was 1024 channels
-            # backbone.layer4, # removed — was 2048 channels
             nn.AdaptiveAvgPool2d((1, 1)),
         )
         self.classifier = nn.Sequential(
