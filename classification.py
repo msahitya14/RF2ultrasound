@@ -16,6 +16,17 @@ from medmnist import BreastMNIST, INFO
 def get_images(rf_folder):
     return 0
 
+def get_rf_loaders():
+    transform = T.ToTensor()
+    dataset = datasets.ImageFolder(root = "rf_Data", transform= transform)
+    train_size = int(0.6 * len(dataset))
+    test_size = len(dataset) - train_size
+    train_data, test_data = random_split(dataset, [train_size, test_size])
+
+    train_loader = DataLoader(train_data, batch_size = int(train_size/5), shuffle = True)
+    test_loader = DataLoader(test_data, batch_size = len(dataset) - int(train_size/5), shuffle = False)
+    return (train_loader, test_loader)
+
 def get_med_loaders(batch_size):
     data_transform = T.ToTensor()
     train_dataset = BreastMNIST(split="train", transform=data_transform, download = True)
@@ -43,6 +54,49 @@ def get_loaders():
 def patch_extraction(envelope, p_width, p_height, r_width, r_height):
     return 0
 
+class rf_CNN(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.features = nn.Sequential(
+            # Block 1 — pool freq aggressively (4x), time gently (2x)
+            nn.Conv2d(1, 32, kernel_size=(7, 3), padding=(3, 1)),
+            nn.BatchNorm2d(32),
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=(4, 2)),   # → [32, 512, 64]
+
+            # Block 2
+            nn.Conv2d(32, 64, kernel_size=(5, 3), padding=(2, 1)),
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=(4, 2)),   # → [64, 128, 32]
+
+            # Block 3
+            nn.Conv2d(64, 128, kernel_size=(3, 3), padding=(1, 1)),
+            nn.BatchNorm2d(128),
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=(4, 2)),   # → [128, 32, 16]
+
+            # Block 4
+            nn.Conv2d(128, 256, kernel_size=(3, 3), padding=(1, 1)),
+            nn.BatchNorm2d(256),
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=(4, 2)),   # → [256, 8, 8]
+
+            nn.AdaptiveAvgPool2d((4, 4))         # → [256, 4, 4]
+        )
+        self.classifier = nn.Sequential(
+            nn.Flatten(),                        # → 256*4*4 = 4096
+            nn.Linear(4096, 256),
+            nn.ReLU(),
+            nn.Dropout(0.5),
+            nn.Linear(256, 1)                   # binary logit
+        )
+
+    def forward(self, x):
+        return self.classifier(self.features(x))
+    
+
+    
 # May consider 2 channels: envelope and bmode
 class CNN(nn.Module):
     def __init__(self):
@@ -76,6 +130,7 @@ class CNN(nn.Module):
     def forward(self, x):
         x = self.features(x)
         return self.classifier(x)
+    
 
 # @param model: CNN
 # @param dataloader: bmode_image, label 
