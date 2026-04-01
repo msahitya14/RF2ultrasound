@@ -6,8 +6,8 @@ const WebSocket = require("ws")
 
 const app = express()
 
-const key  = fs.readFileSync(path.join(__dirname, "10.8.227.137+2-key.pem"))
-const cert = fs.readFileSync(path.join(__dirname, "10.8.227.137+2.pem"))
+const key  = fs.readFileSync(path.join(__dirname, "10.8.146.142+2-key.pem"))
+const cert = fs.readFileSync(path.join(__dirname, "10.8.146.142+2.pem"))
 
 const server = https.createServer({ key, cert }, app)
 
@@ -49,7 +49,7 @@ app.get("/angles", (req, res) => {
 	res.json(latestAngles)
 })
 
-const HOST = "10.8.227.137"
+const HOST = "10.8.146.142"
 const PORT = process.env.PORT || 3000
 
 server.listen(PORT, "0.0.0.0", () => {

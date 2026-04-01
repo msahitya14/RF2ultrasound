@@ -11,12 +11,12 @@ export default defineConfig({
 		strictPort: true,
 		allowedHosts: true,
 		https: {
-			key: fs.readFileSync(path.resolve(__dirname, "10.8.227.137+2-key.pem")),
-			cert: fs.readFileSync(path.resolve(__dirname, "10.8.227.137+2.pem")),
+			key: fs.readFileSync(path.resolve(__dirname, "10.8.146.142+2-key.pem")),
+			cert: fs.readFileSync(path.resolve(__dirname, "10.8.146.142+2.pem")),
 		},
 		proxy: {
-			"/ws": { target: "https://10.8.227.137:3000", ws: true, secure: false },
-			"/angles": { target: "https://10.8.227.137:3000", secure: false },
+			"/ws": { target: "https://10.8.146.142:3000", ws: true, secure: false },
+			"/angles": { target: "https://10.8.146.142:3000", secure: false },
 		},
 	},
 })
