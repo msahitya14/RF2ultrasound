@@ -2,51 +2,50 @@
 
 ## Getting Started
 
-This project serves a web app and WebSocket server for ultrasound angle guidance.
+This project serves a web app and WebSocket server for ultrasound angle guidance. Your phone acts as the sensor, sending gyroscope/orientation data to the server over WebSocket.
 
 ### Prerequisites
 
 - Node.js (v16 or newer recommended)
 - npm
+- [mkcert](https://github.com/FiloSottile/mkcert) — for generating local HTTPS certificates
 
 ### Setup & Run
 
 1. **Install dependencies:**
-
-   ```sh
+```sh
    npm install
-   ```
+```
 
-2. **Start the backend server (HTTPS + WebSocket):**
+2. **Install mkcert (first time only):**
+```sh
+   brew install mkcert
+   mkcert -install
+```
 
-   ```sh
-   node server.cjs
-   ```
+3. **Start the app:**
+```sh
+   bash start.sh
+```
 
-   - This serves the production build (from `dist/`) and the WebSocket endpoint on port 3000.
-   - Make sure your SSL certificates (`localhost-key.pem` and `localhost-cert.pem`) are present in the project root. See `HTTPS_SETUP.md` for details.
+   This script will:
+   - Detect your local IP address
+   - Remove any old certificates and generate new ones for your current IP
+   - Kill anything running on ports 3000 and 5173
+   - Start the HTTPS + WebSocket backend on port 3000
+   - Start the Vite dev server on port 5173
 
-3. **(Optional) Start the frontend in development mode:**
+4. **Open on your phone:**
 
-   ```sh
-   npm run dev
-   ```
-
-   - This runs the Vite dev server (usually on port 5173).
-   - For production, use the backend server only.
-
-4. **Access the app from your device:**
-   - Find your computer's LAN IP address (e.g., `172.31.70.230`).
-   - On your phone or another device on the same Wi-Fi/LAN, open a browser and go to:
-     - `https://<your-ip>:3000/` (for production)
-     - or `https://<your-ip>:5173/` (for development)
-   - Accept any SSL warnings if using self-signed certificates.
+   The script will print a URL like:
+```
+   https://192.168.x.x:5173
+```
+   Open that on your phone (must be on the same Wi-Fi network). Accept the SSL warning if prompted.
 
 ### Notes
 
-- The WebSocket endpoint is at `/ws` (e.g., `wss://<your-ip>:3000/ws`).
+- HTTPS is required — Safari and Chrome will not expose gyroscope/orientation sensors over plain HTTP.
+- The WebSocket endpoint is at `/ws` (e.g., `wss://<your-ip>:5173/ws`).
+- The angles endpoint is at `/angles` (e.g., `https://<your-ip>:3000/angles`).
 - Both your computer and phone must be on the same local network.
-- For HTTPS setup, see `HTTPS_SETUP.md`.
-
----
-
