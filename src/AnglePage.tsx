@@ -77,7 +77,9 @@ export default function AnglePage() {
     let timer: ReturnType<typeof setTimeout>
     const connect = () => {
       setWsStatus("connecting")
-      ws = new WebSocket(`wss://10.8.146.142:5173/ws`)
+      const scheme = window.location.protocol === 'https:' ? 'wss' : 'ws'
+      const endpoint = `${scheme}://${window.location.host}/ws`
+      ws = new WebSocket(endpoint)
       ws.onopen = () => setWsStatus("connected")
       ws.onerror = () => setWsStatus("error")
       ws.onclose = () => { setWsStatus("disconnected"); timer = setTimeout(connect, 2000) }
