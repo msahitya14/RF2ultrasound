@@ -6,9 +6,8 @@ const WebSocket = require("ws")
 
 const app = express()
 
-const key  = fs.readFileSync(path.join(__dirname, "10.8.213.214+3-key.pem"))
-const cert = fs.readFileSync(path.join(__dirname, "10.8.213.214+3.pem"))
-
+const key = fs.readFileSync('key.pem', 'utf8');
+const cert = fs.readFileSync('cert.pem', 'utf8');
 
 const server = https.createServer({ key, cert }, app)
 
