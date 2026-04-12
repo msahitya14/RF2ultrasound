@@ -5,19 +5,14 @@ from torch.utils.data import DataLoader, Subset, random_split
 from torchvision import datasets, transforms, models
 from torchvision.models import ResNet50_Weights
 import torchvision.transforms as T
-import medmnist
-from medmnist import BreastMNIST, INFO
-
-
-
-# Convert rf_data to b-mode images
-# Needs rf_folder to have True and False folders for classes
-# TODO:
-def get_images(rf_folder):
-    return 0
+#import medmnist
+#from medmnist import BreastMNIST, INFO
 
 def get_rf_loaders():
-    transform = T.ToTensor()
+    transform = T.Compose([
+        T.Resize((480, 640)),
+        T.ToTensor()
+    ])
     dataset = datasets.ImageFolder(root = "rf_Data", transform= transform)
     train_size = int(0.6 * len(dataset))
     test_size = len(dataset) - train_size
@@ -27,7 +22,8 @@ def get_rf_loaders():
     test_loader = DataLoader(test_data, batch_size = len(dataset) - int(train_size/5), shuffle = False)
     return (train_loader, test_loader)
 
-def get_med_loaders(batch_size):
+# Testing on ultrasound image dataset
+# def get_med_loaders(batch_size):
     data_transform = T.ToTensor()
     train_dataset = BreastMNIST(split="train", transform=data_transform, download = True)
     test_dataset = BreastMNIST(split ="test", transform=data_transform, download = True)
@@ -37,7 +33,11 @@ def get_med_loaders(batch_size):
 
 # TODO: adjust batch size to fit 
 def get_loaders():
-    transform = T.ToTensor()
+    transform = T.Compose([
+        T.Resize((480, 640)),
+        T.Grayscale(num_output_channels=1),
+        T.ToTensor()
+    ])
     dataset = datasets.ImageFolder(root = "Data", transform= transform)
     train_size = int(0.6 * len(dataset))
     test_size = len(dataset) - train_size
@@ -47,14 +47,14 @@ def get_loaders():
     test_loader = DataLoader(test_data, batch_size = len(dataset) - int(train_size/5), shuffle = False)
     return (train_loader, test_loader)
 
-# Divides envelope into patches
+# Divides envelope into patches if needed
 # @param p_width, p_height = width and height of patches
 # @param r_width, r_height = width and height of rf data
-# TODO
-def patch_extraction(envelope, p_width, p_height, r_width, r_height):
+# def patch_extraction(envelope, p_width, p_height, r_width, r_height):
     return 0
 
-class rf_CNN(nn.Module):
+# If we need classification with raw data
+# class rf_CNN(nn.Module):
     def __init__(self):
         super().__init__()
         self.features = nn.Sequential(
@@ -175,6 +175,16 @@ def evaluate(model, dataloader, criterion, device):
     print(f"Test_correct: {correct} out of {samples}")
     return correct/samples
 
+def predict(model, image, device):
+    image = image.to(device)
+    logits = model(image)
+    predict = (logits.sigmoid()>0.5).long().view(-1)
+    print("Prediction:", predict)
+
+def load_model():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = CNN().to(device)
+    return model
 
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -182,8 +192,8 @@ def main():
     criterion = nn.BCEWithLogitsLoss()
     learning_rate = 0.0005
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay= 0.001)
-    epochs = 25
-    train_loader, test_loader = get_med_loaders(128)
+    epochs = 10
+    train_loader, test_loader = get_loaders()
     for i in range(epochs):
         train_error = train(model, train_loader, optimizer, criterion, device)
         test_error = evaluate(model, test_loader, criterion, device)
