@@ -15,6 +15,9 @@ import re
 import pandas as pd
 from sklearn.model_selection import train_test_split
 import random
+import math
+from sklearn.linear_model import Ridge
+from sklearn.preprocessing import StandardScaler
 
 def parse_filename(filename):
     """
@@ -123,12 +126,17 @@ def load_echocare_backbone(checkpoint_path, in_channels=3, feature_size=128):
     return encoder
 
 class Regression(nn.Module):
-    def __init__(self, backbone, feature_size=128):
+    def __init__(self, backbone):
         super().__init__()
         self.backbone = backbone
         self.pool = nn.AdaptiveAvgPool2d(1)
 
-        fused_dim = 1024 + 2048  # = 3072
+        # Project each scale to same dim before fusion
+        self.proj2 = nn.Conv2d(512,  128, 1)   # f2
+        self.proj3 = nn.Conv2d(1024, 128, 1)   # f3
+        self.proj4 = nn.Conv2d(2048, 128, 1)   # f4
+
+        fused_dim = 128 * 3  # 384
 
         self.head = nn.Sequential(
             nn.Linear(fused_dim, 256),
@@ -137,67 +145,124 @@ class Regression(nn.Module):
             nn.Linear(256, 64),
             nn.ReLU(),
             nn.Dropout(0.2),
-            nn.Linear(64, 2)        # (Δx, Δy)
+            nn.Linear(64, 2)
         )
 
     def forward(self, x):
-        x_outs = self.backbone(x)   # list of 5 feature maps
+        outs = self.backbone(x)
 
-        # Take last two: [1, 1024, 16, 16] and [1, 2048, 8, 8]
-        f4 = self.pool(x_outs[-2]).flatten(1)   # (B, 1024)
-        f5 = self.pool(x_outs[-1]).flatten(1)   # (B, 2048)
+        # Multi-scale: use f2, f3, f4 — f2 retains more spatial info
+        f2 = self.pool(self.proj2(outs[2])).flatten(1)  # (B, 128)
+        f3 = self.pool(self.proj3(outs[3])).flatten(1)  # (B, 128)
+        f4 = self.pool(self.proj4(outs[4])).flatten(1)  # (B, 128)
 
-        fused = torch.cat([f4, f5], dim=1)      # (B, 3072)
+        fused = torch.cat([f2, f3, f4], dim=1)          # (B, 384)
         return self.head(fused)
     
 class NeckDataset(Dataset):
     """
     CSV columns: image_path, delta_x, delta_y
+ 
+    Label normalisation
+    -------------------
+    Pass label_mean / label_std (computed from the TRAIN split only) to both
+    train and val datasets so targets live in ~[-2, 2] during training.
+ 
+    Usage
+    -----
+        train_ds = NeckDataset("train.csv", augment=True)
+        val_ds   = NeckDataset("val.csv",   augment=False,
+                               label_mean=train_ds.label_mean,
+                               label_std=train_ds.label_std)
     """
-    def __init__(self, csv_path, augment=False, mean=None, std=None):
+ 
+    def __init__(self, csv_path, augment=False,
+                 image_mean=None, image_std=None,
+                 label_mean=None, label_std=None):
+ 
         self.df      = pd.read_csv(csv_path)
         self.augment = augment
-
-        # Use provided mean/std, else safe default for grayscale ultrasound
-        mean = mean or [0.5, 0.5, 0.5]
-        std  = std  or [0.5, 0.5, 0.5]
-
+ 
+        # ── image normalisation ───────────────────────────────────────────────
+        image_mean = image_mean or [0.5, 0.5, 0.5]
+        image_std  = image_std  or [0.5, 0.5, 0.5]
+ 
         self.transform = transforms.Compose([
             transforms.Resize((256, 256)),
             transforms.Grayscale(num_output_channels=3),
-            transforms.ToTensor(),              # [0,255] → [0,1]
-            transforms.Normalize(mean, std),    # [0,1]   → ~[-1,1]
+            transforms.ToTensor(),
+            transforms.Normalize(image_mean, image_std),
         ])
-
+ 
+        # ── label normalisation ───────────────────────────────────────────────
+        # If not provided, compute from this CSV (should only be the train split)
+        if label_mean is not None and label_std is not None:
+            self.label_mean = torch.tensor(label_mean, dtype=torch.float32)
+            self.label_std  = torch.tensor(label_std,  dtype=torch.float32)
+        else:
+            self.label_mean = torch.tensor(
+                [self.df["delta_x"].mean(), self.df["delta_y"].mean()],
+                dtype=torch.float32)
+            self.label_std  = torch.tensor(
+                [self.df["delta_x"].std(),  self.df["delta_y"].std()],
+                dtype=torch.float32)
+ 
+    # ── helpers ───────────────────────────────────────────────────────────────
+ 
+    def normalize_label(self, label: torch.Tensor) -> torch.Tensor:
+        return (label - self.label_mean) / self.label_std
+ 
+    def denormalize_label(self, label: torch.Tensor) -> torch.Tensor:
+        """Call this on model output to get back pixel units."""
+        return label * self.label_std + self.label_mean
+ 
+    # ── dataset protocol ─────────────────────────────────────────────────────
+ 
     def __len__(self):
         return len(self.df)
-
+ 
     def __getitem__(self, idx):
-        row   = self.df.iloc[idx]
-        image = Image.open(row["image_path"])
+        row    = self.df.iloc[idx]
+        image  = Image.open(row["image_path"])
         dx, dy = float(row["delta_x"]), float(row["delta_y"])
-
+ 
         if self.augment:
             image, dx, dy = self._augment(image, dx, dy)
-
+ 
         image = self.transform(image)
-        label = torch.tensor([dx, dy], dtype=torch.float32)
+        label = self.normalize_label(
+            torch.tensor([dx, dy], dtype=torch.float32)
+        )
         return image, label
-
+ 
+    # ── augmentation ─────────────────────────────────────────────────────────
+ 
     def _augment(self, image, dx, dy):
-        # Spatial — label must mirror image
+        # Horizontal flip — label x inverts
+        # (safe for ultrasound; probe left/right is arbitrary)
         if random.random() > 0.5:
             image = TF.hflip(image)
             dx = -dx
-
+ 
+        # Vertical flip removed — ultrasound depth axis (near→far) must not flip
+ 
+        # Small rotation — rotate the (dx, dy) vector by the same angle
         if random.random() > 0.5:
-            image = TF.vflip(image)
-            dy = -dy
-
-        # Intensity — no label change needed
+            angle = random.uniform(-10, 10)
+            image = TF.rotate(image, angle)
+            rad   = math.radians(angle)
+            dx, dy = (dx * math.cos(rad) - dy * math.sin(rad),
+                      dx * math.sin(rad) + dy * math.cos(rad))
+ 
+        # Intensity — gain / TGC variation common in ultrasound
         image = TF.adjust_brightness(image, random.uniform(0.8, 1.2))
         image = TF.adjust_contrast(image,   random.uniform(0.8, 1.2))
-
+ 
+        # Speckle-like noise
+        tensor = TF.to_tensor(image)
+        tensor = torch.clamp(tensor + torch.randn_like(tensor) * 0.02, 0, 1)
+        image  = TF.to_pil_image(tensor)
+ 
         return image, dx, dy
     
 # ─────────────────────────────────────────────────────────
@@ -288,8 +353,8 @@ def train(model, train_loader, val_loader, device="cuda"):
     # Phase 2: unfreeze backbone — adapt to your neck feature
     set_backbone_frozen(model, frozen=False)
     optimizer = torch.optim.AdamW([
-        {"params": model.head.parameters(),     "lr": 5e-4},
-        {"params": model.backbone.parameters(), "lr": 1e-4},  # very slow
+        {"params": model.head.parameters(),     "lr": 1e-4},
+        {"params": model.backbone.parameters(), "lr": 1e-6},  # very slow
     ], weight_decay=1e-4)
     run_phase(model, train_loader, val_loader,
               epochs=5, optimizer=optimizer,
@@ -329,6 +394,36 @@ def predict_folder(model, folder_path, device="cuda", mean=None, std=None):
             pred = model(image).squeeze(0).cpu().numpy()
             print(f"{filename} | delta_x: {pred[0]:+.3f}, delta_y: {pred[1]:+.3f}")
 
+def sanity_check():
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    backbone = load_echocare_backbone(
+        checkpoint_path="./echocare_encoder.pth"
+    )
+    model = Regression(backbone)
+
+    # ── Datasets ──
+    train_dataset = NeckDataset("data/train.csv", augment=True)
+    val_dataset   = NeckDataset("data/val.csv",   augment=False)
+
+    train_loader = DataLoader(train_dataset, batch_size=8, shuffle=True,  num_workers=4)
+    val_loader   = DataLoader(val_dataset,   batch_size=8, shuffle=False, num_workers=4)
+    model.train()
+    images, labels = next(iter(train_loader))
+    images, labels = images[:1].to(device), labels[:1].to(device)
+
+    feats, targets = [], []
+    for images, labels in train_loader:
+        feats.append(images.mean(dim=[2,3]).numpy())  # (B, 3) — just mean pixel per channel
+        targets.append(labels.numpy())
+
+    feats   = np.vstack(feats)
+    targets = np.vstack(targets)
+
+    scaler = StandardScaler()
+    feats  = scaler.fit_transform(feats)
+
+    reg = Ridge().fit(feats, targets)
+    print("R² on train:", reg.score(feats, targets))
 
 def main():
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -375,5 +470,6 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    sanity_check()
+    
 
