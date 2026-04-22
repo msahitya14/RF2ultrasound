@@ -14,7 +14,7 @@ def get_rf_loaders():
         T.ToTensor()
     ])
     dataset = datasets.ImageFolder(root = "rf_Data", transform= transform)
-    train_size = int(0.6 * len(dataset))
+    train_size = int(0.8 * len(dataset))
     test_size = len(dataset) - train_size
     train_data, test_data = random_split(dataset, [train_size, test_size])
 
@@ -34,12 +34,12 @@ def get_rf_loaders():
 # TODO: adjust batch size to fit 
 def get_loaders():
     transform = T.Compose([
-        T.Resize((480, 640)),
+        T.Resize((640, 480)),
         T.Grayscale(num_output_channels=1),
         T.ToTensor()
     ])
     dataset = datasets.ImageFolder(root = "Data", transform= transform)
-    train_size = int(0.6 * len(dataset))
+    train_size = int(0.8 * len(dataset))
     test_size = len(dataset) - train_size
     train_data, test_data = random_split(dataset, [train_size, test_size])
 
@@ -190,9 +190,9 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = CNN().to(device)
     criterion = nn.BCEWithLogitsLoss()
-    learning_rate = 0.0005
+    learning_rate = 0.001
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay= 0.001)
-    epochs = 10
+    epochs = 5
     train_loader, test_loader = get_loaders()
     for i in range(epochs):
         train_error = train(model, train_loader, optimizer, criterion, device)

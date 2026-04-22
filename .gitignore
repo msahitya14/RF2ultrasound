@@ -1,2 +1,6 @@
-Data/
 echocare_encoder.pth
+train.csv
+labels.csv
+val.csv
+/TestImages
+/Images

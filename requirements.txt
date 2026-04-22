@@ -4,3 +4,5 @@ torchvision
 monai
 pandas
 einops
+pillow
+scikit-learn
