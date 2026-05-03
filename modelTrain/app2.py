@@ -362,4 +362,15 @@ if __name__ == "__main__":
         ssl_certfile="cert.pem" if ssl_context else None,
     )
 
+# cd /Users/collinchuang/Downloads/RF2ultrasound/modelTrain
+# python3 predict.py --checkpoint checkpoints/best_model.pt --image test_images/image1.png
+
+# cd /Users/collinchuang/Downloads/RF2ultrasound/modelTrain
+# python3 predict.py --checkpoint checkpoints/best_model.pt --image_dir test_images
+
+# cd /Users/collinchuang/Downloads/RF2ultrasound/modelTrain
+# python3 app.py --checkpoint checkpoints/best_model.pt --port 3000
+
+# curl -X POST "http://localhost:3000/predict/image" \
+#   -F "image=@test_images/image1.png"
 
