@@ -1,33 +1,15 @@
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 from monai.networks.nets.swin_unetr import SwinTransformer
-from torch.utils.data import Dataset, DataLoader
-from torch.utils.data import DataLoader, Subset, random_split
-from torchvision import datasets, transforms, models
-from torchvision import transforms as T
-import torchvision.transforms.functional as TF
-import pandas as pd
-import numpy as np
-import os
-from PIL import Image
 import re
+import os
 import pandas as pd
-from sklearn.model_selection import train_test_split
-import random
-import math
-from sklearn.linear_model import Ridge
-from sklearn.preprocessing import StandardScaler
+from torch.utils.data import Dataset, DataLoader, random_split
+from PIL import Image
+from torchvision import transforms as T
+import torch.nn as nn
+checkpoint_path = "./echocare_encoder.pth"
 
 def parse_filename(filename):
-    """
-    Parses delta_x and delta_y from filenames like:
-    frame_20260407_004352_2723_0006_xm3_629_y3_376
-    
-    xm3_629  → -3.629
-    y3_376   → +3.376
-    ym0_860  → -0.860
-    """
     # Match x and y values — m prefix means negative
     pattern = r'_x(m?)(\d+)_(\d+)_y(m?)(\d+)_(\d+)'
     match = re.search(pattern, filename)
@@ -39,71 +21,175 @@ def parse_filename(filename):
     x_neg, x_int, x_dec, y_neg, y_int, y_dec = match.groups()
 
     delta_x = float(f"{x_int}.{x_dec}")
-    delta_y = float(f"{y_int}.{y_dec}")
 
     if x_neg == "m":
         delta_x = -delta_x
-    if y_neg == "m":
-        delta_y = -delta_y
 
-    return delta_x, delta_y
+    return delta_x
 
+def set_backbone_frozen(model, frozen: bool):
+    for param in model.backbone.parameters():
+        param.requires_grad = not frozen
+    print(f"Backbone {'frozen' if frozen else 'unfrozen'}")
 
-def build_csv_from_folder(folder_path, output_csv="data/labels.csv"):
-    """
-    Walks through a folder of images, parses (delta_x, delta_y) from
-    each filename, and saves a CSV ready for NeckDataset.
-    """
-    valid_extensions = (".png", ".jpg", ".jpeg", ".bmp", ".tiff")
-    rows = []
-    skipped = 0
+class ImageDataset(Dataset):
+    def __init__(self, csv_file):
+        # Load the CSV file once during initialization
+        self.data = pd.read_csv(csv_file)
+        self.transform = T.Compose([
+                T.Resize((224, 224)),
+                T.Grayscale(num_output_channels=3),
+                T.ToTensor()
+            ])
 
-    for filename in sorted(os.listdir(folder_path)):
-        if not filename.lower().endswith(valid_extensions):
-            continue
+        # now compute stats on cleaned data
+        self.min = self.data["delta_x"].quantile(0.2)
+        self.max = self.data["delta_x"].quantile(0.8)
 
-        result = parse_filename(filename)
-        if result is None:
-            skipped += 1
-            continue
+    def __len__(self):
+        # Return the total number of samples
+        return len(self.data)
 
-        delta_x, delta_y = result
-        image_path = os.path.join(folder_path, filename)
-        rows.append({
-            "image_path": image_path,
-            "delta_x":    delta_x,
-            "delta_y":    delta_y,
-        })
+    def __getitem__(self, idx):
+        # Retrieve a single row at the given index
+        # Use .iloc to access the specific row
+        sample = self.data.iloc[idx]
 
-    df = pd.DataFrame(rows)
-    os.makedirs(os.path.dirname(output_csv), exist_ok=True)
-    df.to_csv(output_csv, index=False)
+        # Separate features (X) and label (y)
+        # Convert them to tensors (ensure they are numeric types)
+        image = Image.open(sample["image_path"])
+        image = self.transform(image)
+        delta_x = sample["delta_x"]
+        label = torch.tensor(delta_x, dtype = torch.float32)
 
-    print(f"Parsed {len(rows)} images, skipped {skipped}")
-    print(f"Saved to {output_csv}")
-    print(df.head())
-    return df
+        label = (label - self.min) / (self.max - self.min)
+        label = label * 2 - 1
+        label = torch.clamp(label, -1, 1)
+        return image, label
 
-# Adjust batch size and split accordingly to dataset size
-def get_loaders():
-    transform = T.Compose([
-        T.Resize((640, 480)),
-        T.Grayscale(num_output_channels=3),
-        T.ToTensor()
-    ])
-    dataset = datasets.ImageFolder(root = "Data", transform= transform)
-    train_size = int(0.8 * len(dataset))
-    test_size = len(dataset) - train_size
-    train_data, test_data = random_split(dataset, [train_size, test_size])
+class Regression(nn.Module):
+    def __init__(self, backbone):
+      super().__init__()
+      self.backbone = backbone
 
-    train_loader = DataLoader(train_data, batch_size = int(train_size/5), shuffle = True)
-    test_loader = DataLoader(test_data, batch_size = len(dataset) - int(train_size/5), shuffle = False)
-    return (train_loader, test_loader)
+      self.head = nn.Sequential(
+        nn.AdaptiveAvgPool2d(1),  # [1, 2048, 8, 8] → [1, 2048, 1, 1]
+        nn.Flatten(),             # → [1, 2048]
+        nn.Linear(2048, 512),
+        nn.ReLU(),
+        nn.Dropout(0.3),
+        nn.Linear(512, 1)         # → [1, 1]  (single tilt value)
+      )
 
-def load_echocare_backbone(checkpoint_path, in_channels=3, feature_size=128):
+    def forward(self, x):
+      features = self.backbone(x)
+      x = features[-1] # use more features if needed
+      return self.head(x)
+    
+
+def train(model, train_loader, val_loader, num_epochs_frozen=5, num_epochs_finetune=10, device='cuda'):
+    model = model.to(device)
+    criterion = nn.SmoothL1Loss()
+
+    def run_epoch(loader, train=True):
+        model.train() if train else model.eval()
+        total_loss = 0
+
+        with torch.set_grad_enabled(train):
+            for images, labels in loader:
+                images = images.to(device)
+                labels = labels.to(device).float().unsqueeze(1)
+
+                if train:
+                    optimizer.zero_grad()
+
+                preds = model(images)
+                loss = criterion(preds, labels)
+
+                if train:
+                    loss.backward()
+                    optimizer.step()
+
+                total_loss += loss.item()
+
+        return total_loss / len(loader)
+
+    # ── Phase 1: head only ──────────────────────────────────────────
+    set_backbone_frozen(model, frozen=True)
+    optimizer = torch.optim.Adam(model.head.parameters(), lr=1e-3)
+
+    for epoch in range(num_epochs_frozen):
+        train_loss = run_epoch(train_loader, train=True)
+        val_loss   = run_epoch(val_loader,   train=False)
+        print(f"[Frozen]   Epoch {epoch+1}/{num_epochs_frozen} — Train: {train_loss:.4f}  Val: {val_loss:.4f}")
+
+    # ── Phase 2: full fine-tune ─────────────────────────────────────
+    set_backbone_frozen(model, frozen=False)
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-5)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs_finetune)
+
+    best_val_loss = float('inf')
+
+    for epoch in range(num_epochs_finetune):
+        train_loss = run_epoch(train_loader, train=True)
+        val_loss   = run_epoch(val_loader,   train=False)
+        scheduler.step()
+
+        print(f"[Finetune] Epoch {epoch+1}/{num_epochs_finetune} — Train: {train_loss:.4f}  Val: {val_loss:.4f}  LR: {scheduler.get_last_lr()[0]:.2e}")
+
+        # save best checkpoint
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            torch.save(model.state_dict(), 'best_model.pth')
+            print(f"  ↳ saved checkpoint (val loss: {val_loss:.4f})")
+
+    return model
+
+def evaluate(model, test_loader, device='cuda', label_scale=1.0):
+    model = model.to(device)
+    model.eval()
+
+    criterion = nn.SmoothL1Loss()
+
+    all_preds  = []
+    all_labels = []
+    total_loss = 0
+
+    with torch.no_grad():
+        for images, labels in test_loader:
+            images = images.to(device)
+            labels = labels.to(device).float().unsqueeze(1)
+
+            preds = model(images)
+            loss  = criterion(preds, labels)
+            total_loss += loss.item()
+
+            all_preds.append(preds.cpu())
+            all_labels.append(labels.cpu())
+
+    all_preds  = torch.cat(all_preds)  * label_scale  # scale back to degrees if normalized
+    all_labels = torch.cat(all_labels) * label_scale
+
+    avg_loss = total_loss / len(test_loader)
+    mae      = (all_preds - all_labels).abs().mean().item()
+    rmse     = ((all_preds - all_labels) ** 2).mean().sqrt().item()
+
+    print(f"Test Loss (SmoothL1): {avg_loss:.4f}")
+    print(f"MAE:                  {mae:.2f}°")
+    print(f"RMSE:                 {rmse:.2f}°")
+
+    return {
+        'loss':      avg_loss,
+        'mae':       mae,
+        'rmse':      rmse,
+        'preds':     all_preds,
+        'labels':    all_labels,
+    }
+
+def main():
     encoder = SwinTransformer(
-        in_chans=in_channels,
-        embed_dim=feature_size,
+        in_chans=3,
+        embed_dim=128,
         window_size=[8] * 2,
         patch_size=[2] * 2,
         depths=[2, 2, 18, 2],
@@ -116,360 +202,57 @@ def load_echocare_backbone(checkpoint_path, in_channels=3, feature_size=128):
     )
 
     if checkpoint_path is not None:
-        state_dict = torch.load(checkpoint_path, map_location="cpu")
-        state_dict.pop("mask_token", None)  # remove if present
-        encoder.load_state_dict(state_dict, strict=True)
-        print("Loaded EchoCare pretrained weights")
+            state_dict = torch.load(checkpoint_path, map_location="cpu")
+            state_dict.pop("mask_token", None)  # remove if present
+            encoder.load_state_dict(state_dict, strict=True)
+            print("Loaded EchoCare pretrained weights")
     else:
-        print("No checkpoint — using random init (not recommended)")
+            print("No checkpoint — using random init (not recommended)")
 
-    return encoder
+    df = pd.DataFrame(columns=["image_path", "delta_x"])
+    with os.scandir("./Images") as entries:
+        for entry in entries:
+            delta_x = parse_filename(entry.name)
+            df.loc[len(df)] = [f"./Images/{entry.name}", delta_x]
+    df.to_csv("dataset.csv", index=False)
 
-class Regression(nn.Module):
-    def __init__(self, backbone):
-        super().__init__()
-        self.backbone = backbone
-        self.pool = nn.AdaptiveAvgPool2d(1)
+    dataset = ImageDataset(csv_file="dataset.csv")
+    max = dataset.max
+    min = dataset.min
+    train_size = int(0.8 * len(dataset))
+    val_size = int(0.1 * len(dataset))
+    test_size = len(dataset) - train_size - val_size
+    train_data, val_data, test_data = random_split(dataset, [train_size, val_size, test_size])
 
-        # Project each scale to same dim before fusion
-        self.proj2 = nn.Conv2d(512,  128, 1)   # f2
-        self.proj3 = nn.Conv2d(1024, 128, 1)   # f3
-        self.proj4 = nn.Conv2d(2048, 128, 1)   # f4
+    train_loader = DataLoader(train_data, batch_size = 16, shuffle = True) # Reduced batch size from 32 to 8
+    val_loader = DataLoader(val_data, batch_size = 4, shuffle = False) # Reduced batch size from 8 to 4
+    test_loader = DataLoader(test_data, batch_size = 4, shuffle = False) # Reduced batch size from 8 to 4
 
-        fused_dim = 128 * 3  # 384
+    print("Train data length:", len(train_data))
+    print("Test data length:", len(test_data))
+    print("Val data length:", len(val_data))
 
-        self.head = nn.Sequential(
-            nn.Linear(fused_dim, 256),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(256, 64),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(64, 2)
-        )
+    model = Regression(encoder)
+    train(model, train_loader, val_loader)
 
-    def forward(self, x):
-        outs = self.backbone(x)
+    model.load_state_dict(torch.load('best_model.pth'))
+    results = evaluate(model, test_loader, device='cuda', label_scale=1.0)
+    print(f"\n{'Label':>10}  {'Prediction':>10}  {'Error':>10}")
+    print("-" * 36)
+    wrong_direction = 0
+    for label, pred in zip(results['labels'], results['preds']):
+        label_val = label.item()
+        pred_val  = (pred.item() + 1) / 2 * (max - min) + min
+        error_val = pred_val - label_val
+        if (pred_val > 0 and label_val < 0) or (pred_val < 0 and label_val > 0):
+            wrong_direction += 1
+        print(f"{label_val:>10.2f}°  {pred_val:>10.2f}°  {error_val:>+10.2f}°")
 
-        # Multi-scale: use f2, f3, f4 — f2 retains more spatial info
-        f2 = self.pool(self.proj2(outs[2])).flatten(1)  # (B, 128)
-        f3 = self.pool(self.proj3(outs[3])).flatten(1)  # (B, 128)
-        f4 = self.pool(self.proj4(outs[4])).flatten(1)  # (B, 128)
-
-        fused = torch.cat([f2, f3, f4], dim=1)          # (B, 384)
-        return self.head(fused)
+    print()
+    print("Wrong direction:", wrong_direction)
     
-class NeckDataset(Dataset):
-    """
-    CSV columns: image_path, delta_x, delta_y
- 
-    Label normalisation
-    -------------------
-    Pass label_mean / label_std (computed from the TRAIN split only) to both
-    train and val datasets so targets live in ~[-2, 2] during training.
- 
-    Usage
-    -----
-        train_ds = NeckDataset("train.csv", augment=True)
-        val_ds   = NeckDataset("val.csv",   augment=False,
-                               label_mean=train_ds.label_mean,
-                               label_std=train_ds.label_std)
-    """
- 
-    def __init__(self, csv_path, augment=False,
-                 image_mean=None, image_std=None,
-                 label_mean=None, label_std=None):
- 
-        self.df      = pd.read_csv(csv_path)
-        self.augment = augment
- 
-        # ── image normalisation ───────────────────────────────────────────────
-        image_mean = image_mean or [0.5, 0.5, 0.5]
-        image_std  = image_std  or [0.5, 0.5, 0.5]
- 
-        self.transform = transforms.Compose([
-            transforms.Resize((256, 256)),
-            transforms.Grayscale(num_output_channels=3),
-            transforms.ToTensor(),
-            transforms.Normalize(image_mean, image_std),
-        ])
- 
-        # ── label normalisation ───────────────────────────────────────────────
-        # If not provided, compute from this CSV (should only be the train split)
-        if label_mean is not None and label_std is not None:
-            self.label_mean = torch.tensor(label_mean, dtype=torch.float32)
-            self.label_std  = torch.tensor(label_std,  dtype=torch.float32)
-        else:
-            self.label_mean = torch.tensor(
-                [self.df["delta_x"].mean(), self.df["delta_y"].mean()],
-                dtype=torch.float32)
-            self.label_std  = torch.tensor(
-                [self.df["delta_x"].std(),  self.df["delta_y"].std()],
-                dtype=torch.float32)
- 
-    # ── helpers ───────────────────────────────────────────────────────────────
- 
-    def normalize_label(self, label: torch.Tensor) -> torch.Tensor:
-        return (label - self.label_mean) / self.label_std
- 
-    def denormalize_label(self, label: torch.Tensor) -> torch.Tensor:
-        """Call this on model output to get back pixel units."""
-        return label * self.label_std + self.label_mean
- 
-    # ── dataset protocol ─────────────────────────────────────────────────────
- 
-    def __len__(self):
-        return len(self.df)
- 
-    def __getitem__(self, idx):
-        row    = self.df.iloc[idx]
-        image  = Image.open(row["image_path"])
-        dx, dy = float(row["delta_x"]), float(row["delta_y"])
- 
-        if self.augment:
-            image, dx, dy = self._augment(image, dx, dy)
- 
-        image = self.transform(image)
-        label = self.normalize_label(
-            torch.tensor([dx, dy], dtype=torch.float32)
-        )
-        return image, label
- 
-    # ── augmentation ─────────────────────────────────────────────────────────
- 
-    def _augment(self, image, dx, dy):
-        # Horizontal flip — label x inverts
-        # (safe for ultrasound; probe left/right is arbitrary)
-        if random.random() > 0.5:
-            image = TF.hflip(image)
-            dx = -dx
- 
-        # Vertical flip removed — ultrasound depth axis (near→far) must not flip
- 
-        # Small rotation — rotate the (dx, dy) vector by the same angle
-        if random.random() > 0.5:
-            angle = random.uniform(-10, 10)
-            image = TF.rotate(image, angle)
-            rad   = math.radians(angle)
-            dx, dy = (dx * math.cos(rad) - dy * math.sin(rad),
-                      dx * math.sin(rad) + dy * math.cos(rad))
- 
-        # Intensity — gain / TGC variation common in ultrasound
-        image = TF.adjust_brightness(image, random.uniform(0.8, 1.2))
-        image = TF.adjust_contrast(image,   random.uniform(0.8, 1.2))
- 
-        # Speckle-like noise
-        tensor = TF.to_tensor(image)
-        tensor = torch.clamp(tensor + torch.randn_like(tensor) * 0.02, 0, 1)
-        image  = TF.to_pil_image(tensor)
- 
-        return image, dx, dy
-    
-# ─────────────────────────────────────────────────────────
-# 4. LOSS
-# ─────────────────────────────────────────────────────────
-def offset_loss(preds, targets):
-    """
-    Combined MSE + Euclidean distance loss.
-    MSE: stable gradients early in training
-    Euclidean: directly meaningful as spatial error
-    """
-    mse  = F.mse_loss(preds, targets)
-    dist = torch.sqrt(((preds - targets) ** 2).sum(dim=1) + 1e-6).mean()
-    return 0.5 * mse + 0.5 * dist
-
-
-# ─────────────────────────────────────────────────────────
-# 5. FREEZE CONTROL
-# ─────────────────────────────────────────────────────────
-def set_backbone_frozen(model, frozen: bool):
-    for param in model.backbone.parameters():
-        param.requires_grad = not frozen
-    print(f"Backbone {'frozen' if frozen else 'unfrozen'}")
-
-
-# ─────────────────────────────────────────────────────────
-# 6. TRAINING
-# ─────────────────────────────────────────────────────────
-def run_phase(model, train_loader, val_loader, epochs, optimizer, device, label):
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
-    best_val  = float("inf")
-    print(f"\n── {label} ──")
-
-    for epoch in range(epochs):
-        print(f"Epoch: {epoch}")
-        # Train
-        model.train()
-        train_losses = []
-        for images, labels in train_loader:
-            images, labels = images.to(device), labels.to(device)
-            optimizer.zero_grad()
-            preds = model(images)
-            loss  = offset_loss(preds, labels)
-            loss.backward()
-            optimizer.step()
-            train_losses.append(loss.item())
-        scheduler.step()
-
-        # Validate
-        model.eval()
-        dist_errors = []
-        with torch.no_grad():
-            for images, labels in val_loader:
-                images, labels = images.to(device), labels.to(device)
-                preds = model(images)
-                dist  = torch.sqrt(((preds - labels) ** 2).sum(dim=1))
-                dist_errors.extend(dist.cpu().numpy())
-
-        avg_dist = np.mean(dist_errors)
-
-        # Save best model
-        if avg_dist < best_val:
-            best_val = avg_dist
-            torch.save(model.state_dict(), "best_model.pth")
-
-        if (epoch + 1) % 5 == 0:
-            print(f"  Epoch {epoch+1:3d} | "
-                  f"Train loss: {np.mean(train_losses):.4f} | "
-                  f"Mean dist: {avg_dist:.4f} | "
-                  f"Median dist: {np.median(dist_errors):.4f} | "
-                  f"Best: {best_val:.4f}")
-
-    return best_val
-
-
-def train(model, train_loader, val_loader, device="cuda"):
-    model = model.to(device)
-
-    # Phase 1: frozen backbone — validate EchoCare features are useful
-    set_backbone_frozen(model, frozen=True)
-    optimizer = torch.optim.AdamW(
-        model.head.parameters(), lr=1e-3, weight_decay=1e-4
-    )
-    run_phase(model, train_loader, val_loader,
-              epochs=5, optimizer=optimizer,
-              device=device, label="Phase 1: head only (backbone frozen)")
-
-    # Phase 2: unfreeze backbone — adapt to your neck feature
-    set_backbone_frozen(model, frozen=False)
-    optimizer = torch.optim.AdamW([
-        {"params": model.head.parameters(),     "lr": 1e-4},
-        {"params": model.backbone.parameters(), "lr": 1e-6},  # very slow
-    ], weight_decay=1e-4)
-    run_phase(model, train_loader, val_loader,
-              epochs=5, optimizer=optimizer,
-              device=device, label="Phase 2: fine-tune backbone")
-
-    # Load best weights from either phase
-    model.load_state_dict(torch.load("best_model.pth"))
-    print("\nLoaded best model weights")
-    return model
-
-
-def predict_folder(model, folder_path, device="cuda", mean=None, std=None):
-    mean = mean or [0.5, 0.5, 0.5]
-    std  = std  or [0.5, 0.5, 0.5]
-
-    transform = transforms.Compose([
-        transforms.Resize((256, 256)),
-        transforms.Grayscale(num_output_channels=3),
-        transforms.ToTensor(),
-        transforms.Normalize(mean, std),
-    ])
-
-    # Get all images in the folder
-    valid_extensions = (".png", ".jpg", ".jpeg", ".bmp", ".tiff")
-    image_files = [
-        f for f in sorted(os.listdir(folder_path))
-        if f.lower().endswith(valid_extensions)
-    ]
-
-    model.eval()
-    with torch.no_grad():
-        for filename in image_files:
-            image_path = os.path.join(folder_path, filename)
-            image = Image.open(image_path)
-            image = transform(image).unsqueeze(0).to(device)
-
-            pred = model(image).squeeze(0).cpu().numpy()
-            print(f"{filename} | delta_x: {pred[0]:+.3f}, delta_y: {pred[1]:+.3f}")
-
-def sanity_check():
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    backbone = load_echocare_backbone(
-        checkpoint_path="./echocare_encoder.pth"
-    )
-    model = Regression(backbone)
-
-    # ── Datasets ──
-    train_dataset = NeckDataset("data/train.csv", augment=True)
-    val_dataset   = NeckDataset("data/val.csv",   augment=False)
-
-    train_loader = DataLoader(train_dataset, batch_size=8, shuffle=True,  num_workers=4)
-    val_loader   = DataLoader(val_dataset,   batch_size=8, shuffle=False, num_workers=4)
-    model.train()
-    images, labels = next(iter(train_loader))
-    images, labels = images[:1].to(device), labels[:1].to(device)
-
-    feats, targets = [], []
-    for images, labels in train_loader:
-        feats.append(images.mean(dim=[2,3]).numpy())  # (B, 3) — just mean pixel per channel
-        targets.append(labels.numpy())
-
-    feats   = np.vstack(feats)
-    targets = np.vstack(targets)
-
-    scaler = StandardScaler()
-    feats  = scaler.fit_transform(feats)
-
-    reg = Ridge().fit(feats, targets)
-    print("R² on train:", reg.score(feats, targets))
-
-def main():
-    DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Using device: {DEVICE}")
-
-    # ── Parse labels from image filenames → build CSVs ──
-    df = build_csv_from_folder(
-        folder_path="./Images",
-        output_csv="./labels.csv"
-    )
-    print(df[["delta_x", "delta_y"]].describe())
-
-
-    # Split into train/val
-    train_df, val_df = train_test_split(df, test_size=0.2, random_state=42)
-    train_df.to_csv("data/train.csv", index=False)
-    val_df.to_csv("data/val.csv",     index=False)
-    print(f"Train: {len(train_df)} images, Val: {len(val_df)} images")
-    
-
-    # ── Load backbone ──
-    backbone = load_echocare_backbone(
-        checkpoint_path="./echocare_encoder.pth"
-    )
-    model = Regression(backbone)
-
-    # ── Datasets ──
-    train_dataset = NeckDataset("data/train.csv", augment=True)
-    val_dataset   = NeckDataset("data/val.csv",   augment=False)
-
-    train_loader = DataLoader(train_dataset, batch_size=8, shuffle=True,  num_workers=4)
-    val_loader   = DataLoader(val_dataset,   batch_size=8, shuffle=False, num_workers=4)
-
-    # ── Train ──
-    print("Training:")
-    model = train(model, train_loader, val_loader, device=DEVICE)
-
-    # ── Load best weights ──
-    model.load_state_dict(torch.load("best_model.pth"))
-    print("Loaded best model for inference")
-
-    # ── Predict on same image folder ──
-    predict_folder(model, "./TestImages", device=DEVICE)
-
-
 if __name__ == "__main__":
-    sanity_check()
-    
+    main()
+
+
 
