@@ -1,4 +1,5 @@
 echocare_encoder.pth
+best_model.pth
 train.csv
 labels.csv
 val.csv
