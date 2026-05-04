@@ -6,6 +6,12 @@ Phase 2 (fine-tune): Unfreeze backbone, train end-to-end with lower LR.
 
 Usage:
     python train.py --image_dir /path/to/images --output_dir ./checkpoints
+
+    # Resume from a checkpoint, run both phases:
+    python train.py --image_dir /path/to/images --resume ./checkpoints/best_model.pt
+
+    # Load weights and skip straight to Phase 2:
+    python train.py --image_dir /path/to/images --resume ./checkpoints/best_model.pt --resume_phase finetune
 """
 
 import os
@@ -25,6 +31,32 @@ def euclidean_error_deg(preds_norm, targets_norm, dataset):
     preds_deg   = dataset.denormalize(preds_norm.detach().cpu())
     targets_deg = dataset.denormalize(targets_norm.detach().cpu())
     return torch.sqrt(((preds_deg - targets_deg) ** 2).sum(dim=1)).mean().item()
+
+
+def load_checkpoint(path, model, device, optimizer=None):
+    """Load weights (and optionally optimizer state) from a checkpoint.
+
+    Args:
+        path:      Path to the .pt checkpoint file.
+        model:     The model to load weights into.
+        device:    Device to map tensors onto.
+        optimizer: If provided and the checkpoint contains optimizer_state,
+                   that state is restored too (useful for resuming mid-phase).
+
+    Returns:
+        best_val_err (float) — the val_err_deg stored in the checkpoint,
+        or inf if the key is absent (e.g. a checkpoint from an older run).
+    """
+    ckpt = torch.load(path, map_location=device)
+    model.load_state_dict(ckpt['model_state'])
+    if optimizer is not None and 'optimizer_state' in ckpt:
+        optimizer.load_state_dict(ckpt['optimizer_state'])
+    best = ckpt.get('val_err_deg', float('inf'))
+    print(f"  Loaded checkpoint : {path}")
+    print(f"  └─ epoch={ckpt.get('epoch', '?')}  "
+          f"phase={ckpt.get('phase', '?')}  "
+          f"val_err={best:.4f}°")
+    return best
 
 
 def run_epoch(model, loader, optimizer, criterion, device, dataset,
@@ -85,10 +117,11 @@ def train_phase(model, train_loader, val_loader, optimizer, scheduler,
             best_val_err = val_err
             ckpt_path = os.path.join(output_dir, 'best_model.pt')
             torch.save({
-                'epoch':       epoch,
-                'phase':       phase_name,
-                'model_state': model.state_dict(),
-                'val_err_deg': val_err,
+                'epoch':           epoch,
+                'phase':           phase_name,
+                'model_state':     model.state_dict(),
+                'optimizer_state': optimizer.state_dict(),   # ← added
+                'val_err_deg':     val_err,
             }, ckpt_path)
             flag = '  ← best'
 
@@ -111,9 +144,6 @@ def main(args):
     print(f"Device: {device}")
 
     # ── Dataset & splits ────────────────────────────────────────────────────
-    # Build base dataset with NO transform (PIL images returned).
-    # Normalization uses fixed physical bounds (±180° for x, ±90° for y)
-    # so no data-driven stats are needed or stored.
     full_ds = UltrasoundDataset(args.image_dir)
 
     train_split, val_split, test_split = make_splits(
@@ -121,7 +151,6 @@ def main(args):
 
     train_tf, val_tf = get_transforms(img_size=args.img_size, augment=True)
 
-    # TransformDataset is defined at module level → safely picklable
     train_ds = TransformDataset(train_split, train_tf)
     val_ds   = TransformDataset(val_split,   val_tf)
     test_ds  = TransformDataset(test_split,  val_tf)
@@ -129,7 +158,6 @@ def main(args):
     print(f"Splits — train: {len(train_ds)}, val: {len(val_ds)}, "
           f"test: {len(test_ds)}")
 
-    # workers=0 is safest on macOS + Python 3.13 (spawn pickling issues)
     loader_kwargs = dict(batch_size=args.batch_size,
                          num_workers=args.workers,
                          pin_memory=False)
@@ -144,17 +172,31 @@ def main(args):
     history   = []
     best_val_err = float('inf')
 
-    # ── Phase 1: warm-up (head only) ────────────────────────────────────────
-    optimizer = torch.optim.Adam(
-        filter(lambda p: p.requires_grad, model.parameters()),
-        lr=args.lr_warmup, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, patience=5, factor=0.5, min_lr=1e-6)
+    # ── Resume / fine-tune from an existing checkpoint ──────────────────────
+    # Weights are loaded here, before any optimizer is built, so both phases
+    # start from the resumed weights regardless of --resume_phase.
+    if args.resume:
+        print(f"\nResuming from checkpoint: {args.resume}")
+        best_val_err = load_checkpoint(args.resume, model, device)
 
-    best_val_err = train_phase(
-        model, train_loader, val_loader, optimizer, scheduler,
-        criterion, device, full_ds, args.warmup_epochs,
-        'Phase1-WarmUp', args.output_dir, best_val_err, history)
+    # ── Phase 1: warm-up (head only) ────────────────────────────────────────
+    # Skipped when --resume_phase finetune is set (jump straight to Phase 2).
+    skip_warmup = bool(args.resume and args.resume_phase == 'finetune')
+
+    if not skip_warmup:
+        optimizer = torch.optim.Adam(
+            filter(lambda p: p.requires_grad, model.parameters()),
+            lr=args.lr_warmup, weight_decay=1e-4)
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, patience=5, factor=0.5, min_lr=1e-6)
+
+        best_val_err = train_phase(
+            model, train_loader, val_loader, optimizer, scheduler,
+            criterion, device, full_ds, args.warmup_epochs,
+            'Phase1-WarmUp', args.output_dir, best_val_err, history)
+    else:
+        print("Skipping Phase 1 (--resume_phase finetune) — "
+              "jumping straight to fine-tune.")
 
     # ── Phase 2: full fine-tune ──────────────────────────────────────────────
     model.unfreeze_backbone()
@@ -198,5 +240,14 @@ if __name__ == '__main__':
     parser.add_argument('--dropout',         type=float, default=0.4)
     parser.add_argument('--workers',         type=int,   default=0,
                         help='DataLoader workers. Keep 0 on macOS/Python 3.13.')
+    # ── Checkpoint resume ────────────────────────────────────────────────────
+    parser.add_argument('--resume',          default=None,
+                        help='Path to a .pt checkpoint to load weights from '
+                             'before training begins.')
+    parser.add_argument('--resume_phase',    default='both',
+                        choices=['both', 'finetune'],
+                        help='"both" runs Phase 1 then Phase 2 starting from '
+                             'the checkpoint weights. '
+                             '"finetune" skips Phase 1 entirely.')
     args = parser.parse_args()
     main(args)
