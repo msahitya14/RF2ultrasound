@@ -1,134 +1,78 @@
 # RFGuide
 
-Guided needle placement system for emergency cisterna magna access and therapeutic brain cooling. Targets first responders operating within the 5-minute window before irreversible ischemic brain damage.
+Guided needle placement system for emergency cisterna magna access and therapeutic brain cooling.
 
 ---
 
-## Clinical Context
+## How to Run
 
-Exsanguination, cardiac arrest, and massive stroke cause cerebral ischemia. Selective brain cooling via cisterna magna access extends the survivability window, but the procedure requires ultrasound-guided needle placement that demands specialist training. RFGuide removes that bottleneck — providing real-time ML-driven guidance from raw RF ultrasound data, no image interpretation required.
+### Prerequisites (one-time setup)
 
----
-
-## System Pipeline
-
-```
-USB Ultrasound Probe
-       │
-       ▼
-RF Data Acquisition (vendor driver)
-       │
-       ▼
-RF → B-mode Reconstruction  (main.py)
-       │
-       ▼
-ML Inference  (modelTrain/)
-       │
-   ┌───┴───────────────┐
-   ▼                   ▼
-Classification      Regression
-(target present?)   (tilt angle: x, y)
-       │
-       ▼
-FastAPI Server (app.py) + React SPA (src/)
+**1. Node.js** (v18+)
+```bash
+brew install node
 ```
 
----
+**2. Python 3.10+** — comes with macOS, or install via `brew install python`
 
-## Getting Started
+**3. mkcert** — generates trusted local HTTPS certs (required for phone sensor access)
+```bash
+brew install mkcert
+mkcert -install
+```
 
-### Prerequisites
+**4. Python dependencies**
+```bash
+pip3 install -r requirements.txt
+```
 
-- Node.js (v18+) and npm
-- Python 3.10+
-- [mkcert](https://github.com/FiloSottile/mkcert) for local HTTPS certs
-
-### Install dependencies
-
+**5. Node dependencies**
 ```bash
 npm install
-pip install -r requirements.txt
 ```
 
-### Run (build mode — phone-ready HTTPS)
+---
+
+### Run
 
 ```bash
 bash start.sh
 ```
 
-This will:
-1. Detect your local IP and generate `key.pem` / `cert.pem` via mkcert
-2. Build the React frontend (`npm run build` → `dist/`)
-3. Start the FastAPI server on port 3000 with HTTPS
+That's it. The script will:
+1. Detect your Mac's local IP address
+2. Generate HTTPS certs (`key.pem` / `cert.pem`) trusted by your devices
+3. Build the React frontend into `dist/`
+4. Start the FastAPI server at `https://<your-ip>:3000`
 
-Open on your phone: `https://<your-ip>:3000`
+**Open on your phone:** the script prints the URL, e.g. `https://192.168.1.5:3000`
 
-Both devices must be on the same Wi-Fi network. Accept the SSL warning if prompted.
+> Both devices must be on the **same Wi-Fi network**. HTTPS is required — browsers block gyroscope/orientation sensors over plain HTTP.
 
-### Run with ML model
+---
+
+### Run with the image model
 
 ```bash
 bash start.sh --checkpoint modelTrain/checkpoints/best_model.pt
 ```
 
----
-
-## RF Reconstruction
-
-`main.py` converts raw RF echo data into a convex B-mode image.
-
-**Steps:** bandpass filter → Hilbert envelope → time gain compensation → log compression → Cartesian scan conversion → CLAHE + sharpening
-
-**Probe defaults** (`settings.py`):
-```python
-center_freq      = 3e6       # Hz
-fractional_bw    = 0.6
-sector_angle_deg = 70
-curvature_radius = 30        # mm
-```
-
-**Run:**
-```bash
-python main.py
-```
-
-Input: `ae2RF.txt`  
-Output: `Fixed_Convex_B-mode_Reconstruction.png` + heatmap
-
----
-
-## ML Model
-
-**Architecture:** EfficientNet-B0 (ImageNet pretrained) → adaptive pool → dropout → FC regression head  
-**Outputs:** normalized (x, y) probe orientation angles  
-**Bounds:** x ∈ [−180°, +180°], y ∈ [−90°, +90°]
-
-**Training:**
-```bash
-cd modelTrain
-python train.py --image_dir images
-python train.py --image_dir images --resume checkpoints/best_model.pt
-```
-
-**Predict:**
-```bash
-python modelTrain/predict.py --checkpoint modelTrain/checkpoints/best_model.pt --image path/to/image.png
-```
+This enables the `/predict/image` endpoint. Without `--checkpoint`, that endpoint returns 503 but everything else works normally.
 
 ---
 
 ## API Endpoints
 
-| Endpoint | Method | Description |
-|---|---|---|
-| `/angles` | GET | Latest IMU angles |
-| `/predict/image` | POST | Image model inference |
-| `/predict/rf` | POST | RF inference (mock until real model is wired) |
-| `/model/status` | GET | Loaded model info |
-| `/model/image/load` | POST | Hot-swap image checkpoint |
-| `/ws` | WS | Real-time angle stream |
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `GET` | `/angles` | Latest IMU probe angles |
+| `WS` | `/ws` | Real-time angle / calibration stream |
+| `POST` | `/predict/rf` | RF inference (mock until real model is wired) |
+| `POST` | `/predict/image` | Image model inference (needs `--checkpoint`) |
+| `GET` | `/model/status` | Show loaded models and metadata |
+| `POST` | `/model/image/load` | Hot-swap image checkpoint at runtime |
 
-WebSocket messages:
+**WebSocket message format:**
 ```json
 { "type": "calibrate" }
 { "type": "angles", "x": 12.5, "y": -3.2 }
@@ -136,21 +80,49 @@ WebSocket messages:
 
 ---
 
+## RF Reconstruction
+
+Converts raw RF echo data into a convex B-mode image:
+
+```bash
+python3 main.py
+```
+
+Input: `ae2RF.txt` (comma-separated RF samples)
+Output: `Fixed_Convex_B-mode_Reconstruction.png` + heatmap
+
+Probe settings are in `settings.py`.
+
+---
+
+## Training the Image Model
+
+```bash
+cd modelTrain
+python3 train.py --image_dir images
+# Resume from checkpoint:
+python3 train.py --image_dir images --resume checkpoints/best_model.pt
+```
+
+Best val error: ~4.51°. Checkpoint: `modelTrain/checkpoints/best_model.pt`
+
+---
+
 ## Repo Structure
 
 ```
-├── app.py               FastAPI server (serves SPA + all API endpoints)
-├── model.py             EfficientNet regression model
-├── dataset.py           Dataset parser + denorm utils
-├── predict.py           Inference helpers
-├── main.py              RF → B-mode reconstruction
-├── settings.py          Probe parameters
-├── requirements.txt     Python dependencies
-├── src/                 React frontend source
-├── dist/                Built frontend (generated by npm run build)
-├── start.sh             One-command launch
-└── modelTrain/
-    ├── train.py         Two-phase training script
-    ├── test_ws.py       WebSocket test client
-    └── checkpoints/     Saved weights + history
+app.py               FastAPI server — serves SPA + all API endpoints
+model.py             EfficientNet regression model
+dataset.py           Denorm utilities
+predict.py           Inference helpers
+main.py              RF → B-mode reconstruction
+settings.py          Probe parameters (center freq, sector angle, etc.)
+ae2RF.txt            Sample RF data
+requirements.txt     Python dependencies
+src/                 React frontend source
+start.sh             One-command launch
+modelTrain/
+  train.py           Two-phase training script
+  test_ws.py         WebSocket test client
+  checkpoints/       Saved weights + training history
 ```
