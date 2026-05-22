@@ -126,3 +126,10 @@ modelTrain/
   test_ws.py         WebSocket test client
   checkpoints/       Saved weights + training history
 ```
+
+
+<!-- brew install node mkcert && mkcert -install
+pip3 install -r requirements.txt
+npm install 
+bash start.sh
+-->
