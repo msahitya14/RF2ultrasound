@@ -13,22 +13,26 @@ Guided needle placement system for emergency cisterna magna access and therapeut
 brew install node
 ```
 
-**2. Python 3.10+** — comes with macOS, or install via `brew install python`
-
-**3. mkcert** — generates trusted local HTTPS certs (required for phone sensor access)
+**2. mkcert** — generates trusted local HTTPS certs (required for iPhone sensor access)
 ```bash
 brew install mkcert
 mkcert -install
 ```
 
-**4. Python dependencies**
+**3. Python dependencies**
 ```bash
 pip3 install -r requirements.txt
 ```
 
-**5. Node dependencies**
+**4. Node dependencies**
 ```bash
 npm install
+```
+
+**5. Generate certs and build the frontend (one-time, or after switching Wi-Fi networks)**
+```bash
+mkcert -key-file key.pem -cert-file cert.pem "$(ipconfig getifaddr en0)" localhost 127.0.0.1
+npm run build
 ```
 
 ---
@@ -36,28 +40,18 @@ npm install
 ### Run
 
 ```bash
-bash start.sh
+python3 app.py --checkpoint modelTrain/checkpoints/best_model.pt
 ```
 
-That's it. The script will:
-1. Detect your Mac's local IP address
-2. Generate HTTPS certs (`key.pem` / `cert.pem`) trusted by your devices
-3. Build the React frontend into `dist/`
-4. Start the FastAPI server at `https://<your-ip>:3000`
+The server prints the URL to open on your iPhone, e.g.:
 
-**Open on your phone:** the script prints the URL, e.g. `https://192.168.1.5:3000`
-
-> Both devices must be on the **same Wi-Fi network**. HTTPS is required — browsers block gyroscope/orientation sensors over plain HTTP.
-
----
-
-### Run with the image model
-
-```bash
-bash start.sh --checkpoint modelTrain/checkpoints/best_model.pt
+```
+Open on iPhone: https://192.168.1.5:3000
 ```
 
-This enables the `/predict/image` endpoint. Without `--checkpoint`, that endpoint returns 503 but everything else works normally.
+Both devices must be on the **same Wi-Fi network**. HTTPS is required — browsers block gyroscope/orientation sensors over plain HTTP.
+
+> If you switch Wi-Fi networks, re-run the `mkcert` + `npm run build` commands above to regenerate certs for your new IP.
 
 ---
 
@@ -88,10 +82,7 @@ Converts raw RF echo data into a convex B-mode image:
 python3 main.py
 ```
 
-Input: `ae2RF.txt` (comma-separated RF samples)
-Output: `Fixed_Convex_B-mode_Reconstruction.png` + heatmap
-
-Probe settings are in `settings.py`.
+Input: `ae2RF.txt` — Output: `Fixed_Convex_B-mode_Reconstruction.png` + heatmap. Probe settings in `settings.py`.
 
 ---
 
@@ -100,11 +91,9 @@ Probe settings are in `settings.py`.
 ```bash
 cd modelTrain
 python3 train.py --image_dir images
-# Resume from checkpoint:
+# Resume:
 python3 train.py --image_dir images --resume checkpoints/best_model.pt
 ```
-
-Best val error: ~4.51°. Checkpoint: `modelTrain/checkpoints/best_model.pt`
 
 ---
 
@@ -116,11 +105,10 @@ model.py             EfficientNet regression model
 dataset.py           Denorm utilities
 predict.py           Inference helpers
 main.py              RF → B-mode reconstruction
-settings.py          Probe parameters (center freq, sector angle, etc.)
+settings.py          Probe parameters
 ae2RF.txt            Sample RF data
 requirements.txt     Python dependencies
 src/                 React frontend source
-start.sh             One-command launch
 modelTrain/
   train.py           Two-phase training script
   test_ws.py         WebSocket test client

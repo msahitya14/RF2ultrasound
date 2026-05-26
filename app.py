@@ -21,6 +21,7 @@ import asyncio
 import io
 import json
 import os
+import socket
 import ssl
 import argparse
 from datetime import datetime, timezone
@@ -270,22 +271,24 @@ if __name__ == "__main__":
     else:
         print("No --checkpoint supplied — /predict/image will return 503 until one is loaded.")
 
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as _s:
+            _s.connect(("8.8.8.8", 80))
+            local_ip = _s.getsockname()[0]
+    except Exception:
+        local_ip = "localhost"
+
     ssl_context = None
     if os.path.exists("key.pem") and os.path.exists("cert.pem"):
         ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         ssl_context.load_cert_chain("cert.pem", "key.pem")
-        print(f"TLS enabled — https://{args.host}:{args.port}")
+        scheme = "https"
     else:
-        print(f"No TLS certs — http://{args.host}:{args.port}")
+        print("No TLS certs found — running over HTTP (sensors won't work on iPhone).")
+        print("Run `bash start.sh` once to generate certs, then use python3 app.py directly.")
+        scheme = "http"
 
-    print("Endpoints:")
-    print("  GET  /angles")
-    print("  GET  /model/status")
-    print("  POST /model/image/load    (hot-swap image checkpoint)")
-    print("  POST /predict             (RF, alias)")
-    print("  POST /predict/rf")
-    print("  POST /predict/image")
-    print("  WS   /ws")
+    print(f"\nOpen on iPhone: {scheme}://{local_ip}:{args.port}\n")
 
     uvicorn.run(
         app,
