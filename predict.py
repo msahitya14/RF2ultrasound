@@ -37,7 +37,7 @@ def load_model(checkpoint_path: str, device: torch.device):
         model = andrew_model.build_model()
         model.load_state_dict(ckpt)
         model.to(device).eval()
-        print(f"Loaded Andrew's checkpoint: {os.path.basename(checkpoint_path)}")
+        print(f"Loaded Andrew's checkpoint: {os.path.basename(checkpoint_path)}  (no epoch/val_err metadata)")
 
     return model
 
