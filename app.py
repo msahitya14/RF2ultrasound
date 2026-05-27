@@ -221,9 +221,10 @@ async def predict_image(image: UploadFile = File(...)):
         pred = model(inp).squeeze(0).cpu()
 
     if _image_arch == 'andrew':
-        # Single x-tilt output, normalized [-1, 1] with data-specific percentile scaling.
-        # Multiply by X_BOUND as a reasonable approximation; y is not predicted.
-        x = float(pred[0].item() * 180.0)
+        # Single x-tilt output normalized to [-1, 1] via (val - p20) / (p80 - p20) * 2 - 1.
+        # Invert: (pred + 1) / 2 * (p80 - p20) + p20  (percentiles from Andrew's dataset.csv)
+        _P20, _P80 = -13.28, 8.737
+        x = float((pred[0].item() + 1) / 2 * (_P80 - _P20) + _P20)
         y = 0.0
     else:
         x = denormalize_x(pred[0:1]).item()
