@@ -25,11 +25,20 @@ from dataset import parse_xy_from_filename, denormalize_x, denormalize_y
 
 def load_model(checkpoint_path: str, device: torch.device):
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=True)
-    model = UltrasoundLocalizer(dropout=0.0)   # no dropout at inference
-    model.load_state_dict(ckpt['model_state'])
-    model.to(device).eval()
-    print(f"Loaded checkpoint  epoch={ckpt['epoch']}  "
-          f"val_err={ckpt['val_err_deg']:.3f}°")
+
+    if isinstance(ckpt, dict) and 'model_state' in ckpt:
+        model = UltrasoundLocalizer(dropout=0.0)
+        model.load_state_dict(ckpt['model_state'])
+        model.to(device).eval()
+        print(f"Loaded checkpoint  epoch={ckpt['epoch']}  "
+              f"val_err={ckpt['val_err_deg']:.3f}°")
+    else:
+        import andrew_model
+        model = andrew_model.build_model()
+        model.load_state_dict(ckpt)
+        model.to(device).eval()
+        print(f"Loaded Andrew's checkpoint: {os.path.basename(checkpoint_path)}")
+
     return model
 
 

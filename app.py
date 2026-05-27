@@ -56,6 +56,7 @@ _image_transform  = None
 _image_device     = None
 _image_checkpoint = None   # path of the currently loaded checkpoint
 _image_loaded_at  = None   # ISO timestamp
+_image_arch       = None   # 'efficientnet' | 'andrew'
 
 # RF model state (swap MockRFModel for a real one via POST /model/rf/load)
 _rf_model         = None
@@ -86,24 +87,33 @@ def _init_rf_model():
 
 
 def _load_image_model_sync(checkpoint_path: str):
-    """Load (or reload) the UltrasoundLocalizer from a checkpoint. Thread-safe caller
-    must hold _model_lock before calling this."""
+    """Load (or reload) an image model from a checkpoint. Auto-detects architecture.
+    Thread-safe caller must hold _model_lock before calling this."""
     import torch
-    from model import UltrasoundLocalizer
     from predict import load_model, get_transform
 
-    global _image_model, _image_transform, _image_device, _image_checkpoint, _image_loaded_at
+    global _image_model, _image_transform, _image_device, _image_checkpoint, _image_loaded_at, _image_arch
 
     device = torch.device("cuda" if torch.cuda.is_available() else
                           "mps"  if torch.backends.mps.is_available() else "cpu")
-    model     = load_model(checkpoint_path, device)
-    transform = get_transform(224)
+
+    ckpt_peek = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+    if isinstance(ckpt_peek, dict) and 'model_state' in ckpt_peek:
+        arch      = 'efficientnet'
+        transform = get_transform(224)
+    else:
+        import andrew_model
+        arch      = 'andrew'
+        transform = andrew_model.get_transform(224)
+
+    model = load_model(checkpoint_path, device)
 
     _image_model      = model
     _image_transform  = transform
     _image_device     = device
     _image_checkpoint = checkpoint_path
     _image_loaded_at  = datetime.now(timezone.utc).isoformat()
+    _image_arch       = arch
     print(f"Image model loaded: {checkpoint_path} on {device}")
 
 
@@ -210,8 +220,15 @@ async def predict_image(image: UploadFile = File(...)):
     with torch.no_grad():
         pred = model(inp).squeeze(0).cpu()
 
-    x = denormalize_x(pred[0:1]).item()
-    y = denormalize_y(pred[1:2]).item()
+    if _image_arch == 'andrew':
+        # Single x-tilt output, normalized [-1, 1] with data-specific percentile scaling.
+        # Multiply by X_BOUND as a reasonable approximation; y is not predicted.
+        x = float(pred[0].item() * 180.0)
+        y = 0.0
+    else:
+        x = denormalize_x(pred[0:1]).item()
+        y = denormalize_y(pred[1:2]).item()
+
     return PredictImageResponse(x=x, y=y, timestamp=datetime.now(timezone.utc).isoformat())
 
 
