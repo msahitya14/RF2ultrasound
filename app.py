@@ -29,13 +29,33 @@ from typing import Optional
 
 import numpy as np
 import uvicorn
-from fastapi import FastAPI, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from PIL import Image
 from pydantic import BaseModel
 
 app = FastAPI(title="Cisterna Magna Guidance System")
+
+
+# ── Validation error handler ──────────────────────────────────────────────────
+# FastAPI's default handler crashes with UnicodeDecodeError when the request
+# body contains raw binary data (e.g. a PNG sent to a JSON endpoint).
+
+def _sanitize(obj):
+    """Recursively replace bytes with a safe placeholder so JSON encoding never fails."""
+    if isinstance(obj, bytes):
+        return f"<binary {len(obj)} bytes>"
+    if isinstance(obj, dict):
+        return {k: _sanitize(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_sanitize(v) for v in obj]
+    return obj
+
+@app.exception_handler(RequestValidationError)
+async def _validation_error_handler(request: Request, exc: RequestValidationError):
+    return JSONResponse(status_code=422, content={"detail": _sanitize(exc.errors())})
 
 # ── Shared probe state ────────────────────────────────────────────────────────
 
@@ -62,6 +82,14 @@ _rf_model         = None
 _rf_model_name    = None
 _rf_loaded_at     = None
 
+
+class SweepPredictRequest(BaseModel):
+    folder: str   # absolute path to the braindata/ folder
+
+class SweepPredictResponse(BaseModel):
+    best_slice_index: int
+    best_confidence:  float
+    confidences:      list[float]
 
 class MockRFModel:
     """Stub RF model — replace with real inference when available."""
@@ -131,6 +159,24 @@ class PredictImageResponse(BaseModel):
 
 class LoadImageModelRequest(BaseModel):
     checkpoint: str   # absolute or relative path to .pt file
+
+def _slice_confidence(pred) -> float:
+    """
+    Extract a scalar 0-1 confidence from a model output tensor.
+
+    If your model has a classification head as a third output (raw logit
+    for the "target visible" class), uncomment the first branch — that will
+    be used automatically once pred.shape[0] >= 3.
+
+    Default fallback: proximity to the origin.  The image model predicts
+    (x, y) tilt angles; a smaller displacement means the probe is more
+    on-target, so confidence = 1 / (1 + ||pred||).
+    """
+    import torch
+    if pred.shape[0] >= 3:
+        return float(torch.sigmoid(pred[2]).item())
+    norm = float(pred[:2].norm().item())
+    return 1.0 / (1.0 + norm)
 
 
 # ── REST endpoints ────────────────────────────────────────────────────────────
@@ -214,12 +260,69 @@ async def predict_image(image: UploadFile = File(...)):
     return PredictImageResponse(x=x, y=y, timestamp=datetime.now(timezone.utc).isoformat())
 
 
+
+@app.post("/sweep_predict", response_model=SweepPredictResponse)
+async def sweep_predict(body: SweepPredictRequest):
+    """
+    Run the image model on every PNG in the sweep folder (sorted alphabetically
+    = chronologically).  Returns per-slice confidence scores and the index of
+    the best slice.
+
+    The C# client sends:  { "folder": "<abs-path-to-braindata>" }
+    It expects back:      { "best_slice_index": N,
+                            "best_confidence": 0.95,
+                            "confidences": [...] }
+    """
+    import glob as _glob
+    import torch
+
+    folder = body.folder
+    if not os.path.isdir(folder):
+        raise HTTPException(status_code=404, detail=f"Folder not found: {folder}")
+
+    png_files = sorted(_glob.glob(os.path.join(folder, "*.png")))
+    if not png_files:
+        raise HTTPException(status_code=422,
+                            detail=f"No PNG files found in: {folder}")
+
+    # Snapshot model refs (don't hold the lock during inference)
+    async with _model_lock:
+        model     = _image_model
+        transform = _image_transform
+        device    = _image_device
+
+    if model is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Image model not loaded. POST /model/image/load first.",
+        )
+
+    confidences: list[float] = []
+    for path in png_files:
+        try:
+            img = Image.open(path).convert("RGB")
+            inp = transform(img).unsqueeze(0).to(device)
+            with torch.no_grad():
+                pred = model(inp).squeeze(0).cpu()
+            conf = _slice_confidence(pred)
+        except Exception as exc:
+            print(f"[sweep_predict] Skipping {os.path.basename(path)}: {exc}")
+            conf = 0.0
+        confidences.append(conf)
+
+    best_idx = int(np.argmax(confidences))
+    return SweepPredictResponse(
+        best_slice_index=best_idx,
+        best_confidence=float(confidences[best_idx]),
+        confidences=[float(c) for c in confidences],
+    )
+
 # ── WebSocket ─────────────────────────────────────────────────────────────────
 
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
     await ws.accept()
-    print(f"Client connected: {ws.client.host}")
+    print(f"[WS] Client connected: {ws.client.host}")
     try:
         while True:
             raw = await ws.receive_text()
@@ -230,13 +333,16 @@ async def websocket_endpoint(ws: WebSocket):
                     latest_angles["x"]          = data.get("x", 0.0)
                     latest_angles["y"]          = data.get("y", 0.0)
                     latest_angles["updated_at"] = datetime.now(timezone.utc).isoformat()
+                    # high-frequency — no print
                 elif msg_type == "calibrate":
                     latest_angles["calibrated_at"] = datetime.now(timezone.utc).isoformat()
-                print(f"WS received: {data}")
+                    print(f"[WS] Calibrated at {latest_angles['calibrated_at']}")
+                else:
+                    print(f"[WS] Unknown message type: {msg_type}")
             except json.JSONDecodeError:
-                print(f"WS invalid JSON: {raw}")
+                print(f"[WS] Invalid JSON: {raw[:120]}")
     except WebSocketDisconnect:
-        print("Client disconnected")
+        print("[WS] Client disconnected")
 
 
 # ── Static file serving (SPA) ─────────────────────────────────────────────────
@@ -295,4 +401,5 @@ if __name__ == "__main__":
         port=args.port,
         ssl_keyfile="key.pem"  if ssl_context else None,
         ssl_certfile="cert.pem" if ssl_context else None,
+        access_log=False,   # suppress per-request lines; errors still appear
     )
