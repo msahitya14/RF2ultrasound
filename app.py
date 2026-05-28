@@ -82,15 +82,38 @@ _rf_model         = None
 _rf_model_name    = None
 _rf_loaded_at     = None
 
+# 3D chunk model state (None until trained and loaded via POST /model/chunk/load)
+_chunk_model = None
+
 
 class SweepPredictRequest(BaseModel):
     folder: Optional[str] = None          # scan all *.png in folder (sorted alphabetically)
     files:  Optional[list[str]] = None    # explicit ordered list of absolute PNG paths
 
+class ChunkPredictRequest(BaseModel):
+    folder:     Optional[str]       = None  # scan folder for *.png (sorted)
+    files:      Optional[list[str]] = None  # explicit ordered slice paths
+    chunk_size: int                 = 16    # slices per 3D chunk
+    stride:     Optional[int]       = None  # step between chunks; defaults to chunk_size (non-overlapping)
+
+class ChunkResult(BaseModel):
+    chunk_index:  int
+    start_slice:  int
+    end_slice:    int
+    confidence:   float
+    filenames:    list[str]
+
+class ChunkPredictResponse(BaseModel):
+    chunks:     list[ChunkResult]   # sorted best → worst confidence
+    model_stub: bool                # True until a real 3D model is loaded
+
+class SliceResult(BaseModel):
+    index:      int
+    filename:   str
+    confidence: float
+
 class SweepPredictResponse(BaseModel):
-    best_slice_index: int
-    best_confidence:  float
-    confidences:      list[float]
+    slices: list[SliceResult]   # sorted best → worst confidence
 
 class MockRFModel:
     """Stub RF model — replace with real inference when available."""
@@ -319,25 +342,136 @@ async def sweep_predict(body: SweepPredictRequest):
             detail="Image model not loaded. POST /model/image/load first.",
         )
 
-    confidences: list[float] = []
-    for path in png_files:
-        try:
-            img = Image.open(path).convert("RGB")
-            inp = transform(img).unsqueeze(0).to(device)
-            with torch.no_grad():
-                pred = model(inp).squeeze(0).cpu()
-            conf = _slice_confidence(pred)
-        except Exception as exc:
-            print(f"[sweep_predict] Skipping {os.path.basename(path)}: {exc}")
-            conf = 0.0
-        confidences.append(conf)
+    from predict import predict_batch
 
-    best_idx = int(np.argmax(confidences))
-    return SweepPredictResponse(
-        best_slice_index=best_idx,
-        best_confidence=float(confidences[best_idx]),
-        confidences=[float(c) for c in confidences],
+    CHUNK_SIZE = 32
+    confidences: list[float] = []
+    for chunk_start in range(0, len(png_files), CHUNK_SIZE):
+        chunk = png_files[chunk_start : chunk_start + CHUNK_SIZE]
+        try:
+            preds = predict_batch(model, transform, chunk, device)
+            for pred in preds:
+                confidences.append(_slice_confidence(pred))
+        except Exception as exc:
+            print(f"[sweep_predict] Chunk starting at {chunk_start} failed: {exc}")
+            confidences.extend([0.0] * len(chunk))
+
+    ranked = sorted(
+        [
+            SliceResult(
+                index=i,
+                filename=os.path.basename(png_files[i]),
+                confidence=float(confidences[i]),
+            )
+            for i in range(len(confidences))
+        ],
+        key=lambda s: s.confidence,
+        reverse=True,
     )
+    return SweepPredictResponse(slices=ranked)
+
+
+@app.post("/predict/chunks", response_model=ChunkPredictResponse)
+async def predict_chunks(body: ChunkPredictRequest):
+    """
+    3D chunk inference — groups consecutive slices into volumetric chunks and
+    runs a single forward pass per chunk.
+
+    Each chunk tensor has shape [C, D, H, W] (D = chunk_size slices).
+    Chunks are batched into [B, C, D, H, W] for the model forward pass.
+
+    Returns all chunks sorted best → worst confidence.
+    model_stub=true means no 3D model is loaded yet — confidences are mock values.
+    Swap in a real model via POST /model/chunk/load once trained.
+    """
+    import glob as _glob
+    from predict import predict_3d_chunks
+
+    # ── Resolve file list ─────────────────────────────────────────────────────
+    if body.files is not None:
+        png_files = [str(p) for p in body.files]
+        missing = [p for p in png_files if not os.path.isfile(p)]
+        if missing:
+            raise HTTPException(status_code=404,
+                                detail=f"{len(missing)} file(s) not found: {missing[:5]}")
+    elif body.folder:
+        if not os.path.isdir(body.folder):
+            raise HTTPException(status_code=404, detail=f"Folder not found: {body.folder}")
+        png_files = sorted(_glob.glob(os.path.join(body.folder, "*.png")))
+    else:
+        raise HTTPException(status_code=422, detail="Provide 'files' or 'folder'.")
+
+    if not png_files:
+        raise HTTPException(status_code=422, detail="No PNG files to process.")
+
+    chunk_size = body.chunk_size
+    stride     = body.stride if body.stride is not None else chunk_size
+
+    if chunk_size < 1 or stride < 1:
+        raise HTTPException(status_code=422, detail="chunk_size and stride must be >= 1.")
+    if chunk_size > len(png_files):
+        raise HTTPException(status_code=422,
+                            detail=f"chunk_size ({chunk_size}) exceeds number of slices ({len(png_files)}).")
+
+    # ── Build chunk windows ───────────────────────────────────────────────────
+    starts = list(range(0, len(png_files) - chunk_size + 1, stride))
+    chunk_windows = [png_files[s : s + chunk_size] for s in starts]
+
+    # ── Snapshot model ref ────────────────────────────────────────────────────
+    async with _model_lock:
+        model_3d = _chunk_model
+        transform = _image_transform
+        device    = _image_device
+
+    if transform is None:
+        raise HTTPException(status_code=503,
+                            detail="Image transform not ready. Load an image model first via POST /model/image/load.")
+
+    # ── Inference ─────────────────────────────────────────────────────────────
+    BATCH = 8   # chunks per forward pass (3D tensors are larger than 2D)
+    confidences: list[float] = []
+    for i in range(0, len(chunk_windows), BATCH):
+        batch_chunks = chunk_windows[i : i + BATCH]
+        try:
+            confs = predict_3d_chunks(model_3d, transform, batch_chunks, device)
+            confidences.extend(confs)
+        except Exception as exc:
+            print(f"[predict_chunks] Batch at {i} failed: {exc}")
+            confidences.extend([0.0] * len(batch_chunks))
+
+    # ── Build ranked response ─────────────────────────────────────────────────
+    results = [
+        ChunkResult(
+            chunk_index=i,
+            start_slice=starts[i],
+            end_slice=starts[i] + chunk_size - 1,
+            confidence=confidences[i],
+            filenames=[os.path.basename(p) for p in chunk_windows[i]],
+        )
+        for i in range(len(chunk_windows))
+    ]
+    ranked = sorted(results, key=lambda c: c.confidence, reverse=True)
+    return ChunkPredictResponse(chunks=ranked, model_stub=model_3d is None)
+
+
+@app.post("/model/chunk/load")
+async def load_chunk_model(body: LoadImageModelRequest):
+    """
+    Hot-swap the 3D chunk model checkpoint at runtime.
+
+    Not yet implemented — define your 3D model class in model_3d.py, then replace
+    the 501 below with:
+        from model_3d import UltrasoundLocalizer3D
+        ckpt = torch.load(path, map_location="cpu", weights_only=True)
+        m = UltrasoundLocalizer3D(); m.load_state_dict(ckpt["model_state"])
+        m.to(device).eval()
+        async with _model_lock:
+            _chunk_model = m
+            _chunk_loaded_at = datetime.now(timezone.utc).isoformat()
+        return {"status": "ok", "checkpoint": path, "loaded_at": _chunk_loaded_at}
+    """
+    raise HTTPException(status_code=501,
+                        detail="3D model class not yet defined — train one first.")
 
 # ── WebSocket ─────────────────────────────────────────────────────────────────
 

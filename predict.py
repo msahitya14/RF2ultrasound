@@ -52,6 +52,46 @@ def predict_single(model, transform, image_path: str, device: torch.device):
     return x_deg, y_deg
 
 
+def predict_batch(model, transform, image_paths: list, device: torch.device):
+    """Run inference on a list of image paths in a single batched forward pass.
+
+    Returns a list of raw prediction tensors (one per image), each of shape (output_dim,).
+    """
+    imgs = [transform(Image.open(p).convert('RGB')) for p in image_paths]
+    batch = torch.stack(imgs).to(device)
+    with torch.no_grad():
+        preds = model(batch).cpu()
+    return [preds[i] for i in range(preds.shape[0])]
+
+
+def predict_3d_chunks(model_3d, transform, chunks: list[list[str]], device: torch.device):
+    """Run 3D inference on a list of chunks, each chunk being consecutive slice paths.
+
+    Input tensor shape per chunk: [C, D, H, W]  (C=3 RGB, D=slices per chunk)
+    Batched input to model:       [B, C, D, H, W]
+
+    Returns a list of scalar confidence floats, one per chunk.
+    When model_3d is None the function is a stub — returns mock values so the
+    endpoint is exercisable before a real 3D model is trained and loaded.
+    """
+    # Build [B, C, D, H, W] batch
+    batch_list = []
+    for slice_paths in chunks:
+        slices = [transform(Image.open(p).convert('RGB')) for p in slice_paths]
+        # stack along depth → [D, C, H, W], then permute → [C, D, H, W]
+        chunk_tensor = torch.stack(slices).permute(1, 0, 2, 3)
+        batch_list.append(chunk_tensor)
+    batch = torch.stack(batch_list).to(device)   # [B, C, D, H, W]
+
+    if model_3d is None:
+        # Stub: random mock until a 3D model is trained and loaded via POST /model/chunk/load
+        return [float(torch.rand(1).item()) for _ in chunks]
+
+    with torch.no_grad():
+        preds = model_3d(batch).cpu()            # expected shape: [B] or [B, 1]
+    return [float(preds[i].item()) for i in range(len(chunks))]
+
+
 def main(args):
     device = torch.device(
         'cuda' if torch.cuda.is_available() else
