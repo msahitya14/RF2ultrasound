@@ -84,7 +84,8 @@ _rf_loaded_at     = None
 
 
 class SweepPredictRequest(BaseModel):
-    folder: str   # absolute path to the braindata/ folder
+    folder: Optional[str] = None          # scan all *.png in folder (sorted alphabetically)
+    files:  Optional[list[str]] = None    # explicit ordered list of absolute PNG paths
 
 class SweepPredictResponse(BaseModel):
     best_slice_index: int
@@ -265,26 +266,47 @@ async def predict_image(image: UploadFile = File(...)):
 @app.post("/sweep_predict", response_model=SweepPredictResponse)
 async def sweep_predict(body: SweepPredictRequest):
     """
-    Run the image model on every PNG in the sweep folder (sorted alphabetically
-    = chronologically).  Returns per-slice confidence scores and the index of
-    the best slice.
+    Run the image model on a set of PNG slices and return per-slice confidence
+    scores plus the index of the best (most on-target) slice.
 
-    The C# client sends:  { "folder": "<abs-path-to-braindata>" }
-    It expects back:      { "best_slice_index": N,
-                            "best_confidence": 0.95,
-                            "confidences": [...] }
+    Two calling modes:
+      { "files": ["abs/path/a.png", "abs/path/b.png", ...] }
+          Process exactly these files in the given order (preferred).
+          best_slice_index is an index into this list → matches the 3D-view
+          slice list built by the C# client during the current session.
+
+      { "folder": "<abs-path>" }
+          Scan the folder for *.png (sorted alphabetically).  Legacy mode;
+          may include files from previous sessions.
+
+    Confidence proxy (model currently outputs (x, y) tilt angles):
+        conf = 1 / (1 + sqrt(x² + y²))
+    The slice with the smallest predicted tilt is closest to the target.
     """
     import glob as _glob
     import torch
 
-    folder = body.folder
-    if not os.path.isdir(folder):
-        raise HTTPException(status_code=404, detail=f"Folder not found: {folder}")
-
-    png_files = sorted(_glob.glob(os.path.join(folder, "*.png")))
-    if not png_files:
+    # ── Resolve file list ─────────────────────────────────────────────────────
+    if body.files is not None:
+        # Explicit ordered list from the C# client — use as-is (no sort).
+        png_files = [str(p) for p in body.files]
+        missing = [p for p in png_files if not os.path.isfile(p)]
+        if missing:
+            raise HTTPException(
+                status_code=404,
+                detail=f"{len(missing)} file(s) not found: {missing[:5]}"
+            )
+    elif body.folder:
+        folder = body.folder
+        if not os.path.isdir(folder):
+            raise HTTPException(status_code=404, detail=f"Folder not found: {folder}")
+        png_files = sorted(_glob.glob(os.path.join(folder, "*.png")))
+    else:
         raise HTTPException(status_code=422,
-                            detail=f"No PNG files found in: {folder}")
+                            detail="Provide either 'files' (list of paths) or 'folder'.")
+
+    if not png_files:
+        raise HTTPException(status_code=422, detail="No PNG files to process.")
 
     # Snapshot model refs (don't hold the lock during inference)
     async with _model_lock:
