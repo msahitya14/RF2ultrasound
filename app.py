@@ -14,7 +14,8 @@ Endpoints:
     POST /predict             backwards-compat alias for /predict/rf
     GET  /model/status        show currently loaded models and metadata
     POST /model/image/load    hot-swap the image model checkpoint at runtime
-    WS   /ws                  real-time angle / calibration stream
+    WS   /ws                  inbound angle / calibration stream (from the iPhone)
+    WS   /ws/angles           outbound real-time angle stream (to consumers, e.g. Windows app)
 """
 
 import asyncio
@@ -475,6 +476,56 @@ async def load_chunk_model(body: LoadImageModelRequest):
 
 # ── WebSocket ─────────────────────────────────────────────────────────────────
 
+class AngleSubscribers:
+    """
+    Fan-out registry for read-only angle consumers (e.g. the Windows app).
+
+    The iPhone PRODUCES angle samples on /ws; those samples are broadcast to
+    every subscriber connected on /ws/angles so consumers get real-time pushes
+    instead of polling GET /angles.
+    """
+    def __init__(self):
+        self._subs: set[WebSocket] = set()
+        self._lock = asyncio.Lock()
+
+    async def add(self, ws: WebSocket):
+        async with self._lock:
+            self._subs.add(ws)
+
+    async def remove(self, ws: WebSocket):
+        async with self._lock:
+            self._subs.discard(ws)
+
+    async def broadcast(self, message: dict):
+        # Snapshot under the lock, send outside it so a slow client can't block others.
+        async with self._lock:
+            targets = list(self._subs)
+        if not targets:
+            return
+        payload = json.dumps(message)
+        dead = []
+        for ws in targets:
+            try:
+                await ws.send_text(payload)
+            except Exception:
+                dead.append(ws)
+        if dead:
+            async with self._lock:
+                for ws in dead:
+                    self._subs.discard(ws)
+
+
+angle_subscribers = AngleSubscribers()
+
+
+def _angle_snapshot() -> dict:
+    return {
+        "x":          latest_angles["x"],
+        "y":          latest_angles["y"],
+        "updated_at": latest_angles["updated_at"],
+    }
+
+
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
     await ws.accept()
@@ -489,7 +540,8 @@ async def websocket_endpoint(ws: WebSocket):
                     latest_angles["x"]          = data.get("x", 0.0)
                     latest_angles["y"]          = data.get("y", 0.0)
                     latest_angles["updated_at"] = datetime.now(timezone.utc).isoformat()
-                    # high-frequency — no print
+                    # high-frequency — no print; push to all read-only subscribers
+                    await angle_subscribers.broadcast(_angle_snapshot())
                 elif msg_type == "calibrate":
                     latest_angles["calibrated_at"] = datetime.now(timezone.utc).isoformat()
                     print(f"[WS] Calibrated at {latest_angles['calibrated_at']}")
@@ -499,6 +551,29 @@ async def websocket_endpoint(ws: WebSocket):
                 print(f"[WS] Invalid JSON: {raw[:120]}")
     except WebSocketDisconnect:
         print("[WS] Client disconnected")
+
+
+@app.websocket("/ws/angles")
+async def websocket_angles_subscribe(ws: WebSocket):
+    """
+    Read-only angle stream for consumers (the Windows app).
+
+    Pushes {x, y, updated_at} to the client whenever the probe angle changes.
+    The current value is sent immediately on connect so the client doesn't have
+    to wait for the next movement. This endpoint does not expect inbound
+    messages — awaiting receive simply lets us detect disconnects promptly.
+    """
+    await ws.accept()
+    await angle_subscribers.add(ws)
+    print(f"[WS/angles] Subscriber connected: {ws.client.host}")
+    try:
+        await ws.send_text(json.dumps(_angle_snapshot()))   # prime with last known angles
+        while True:
+            await ws.receive_text()   # blocks until the client disconnects
+    except WebSocketDisconnect:
+        print("[WS/angles] Subscriber disconnected")
+    finally:
+        await angle_subscribers.remove(ws)
 
 
 # ── Static file serving (SPA) ─────────────────────────────────────────────────
