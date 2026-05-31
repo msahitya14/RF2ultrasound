@@ -8,31 +8,20 @@ Guided needle placement system for emergency cisterna magna access and therapeut
 
 ### Prerequisites (one-time setup)
 
-**1. Node.js** (v18+)
-```bash
-brew install node
-```
-
-**2. mkcert** — generates trusted local HTTPS certs (required for iPhone sensor access)
+**1. mkcert** — generates trusted local HTTPS certs (required for iPhone sensor access)
 ```bash
 brew install mkcert
 mkcert -install
 ```
 
-**3. Python dependencies**
+**2. Python dependencies**
 ```bash
 pip3 install -r requirements.txt
 ```
 
-**4. Node dependencies**
-```bash
-npm install
-```
-
-**5. Generate certs and build the frontend (one-time, or after switching Wi-Fi networks)**
+**3. Generate certs (one-time, or after switching Wi-Fi networks)**
 ```bash
 mkcert -key-file key.pem -cert-file cert.pem "$(ipconfig getifaddr en0)" localhost 127.0.0.1
-npm run build
 ```
 
 ---
@@ -51,7 +40,7 @@ Open on iPhone: https://192.168.1.5:3000
 
 Both devices must be on the **same Wi-Fi network**. HTTPS is required — browsers block gyroscope/orientation sensors over plain HTTP.
 
-> If you switch Wi-Fi networks, re-run the `mkcert` + `npm run build` commands above to regenerate certs for your new IP.
+> If you switch Wi-Fi networks, re-run the `mkcert` command above to regenerate certs for your new IP.
 
 ---
 
@@ -60,17 +49,57 @@ Both devices must be on the **same Wi-Fi network**. HTTPS is required — browse
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | `GET` | `/angles` | Latest IMU probe angles |
-| `WS` | `/ws` | Real-time angle / calibration stream |
-| `POST` | `/predict/rf` | RF inference (mock until real model is wired) |
-| `POST` | `/predict/image` | Image model inference (needs `--checkpoint`) |
-| `GET` | `/model/status` | Show loaded models and metadata |
+| `GET` | `/model/status` | Show loaded model and metadata |
 | `POST` | `/model/image/load` | Hot-swap image checkpoint at runtime |
+| `POST` | `/predict/image` | Single-image inference — returns `(x, y)` tilt in degrees |
+| `POST` | `/sweep_predict` | Rank all slices in a sweep by model confidence (best → worst) |
+| `POST` | `/predict/chunks` | 3D chunk inference — groups consecutive slices into volumetric chunks |
+| `POST` | `/model/chunk/load` | Hot-swap 3D chunk model (stub until 3D model is trained) |
+| `WS` | `/ws` | Inbound stream from iPhone — sends angle and calibration events |
+| `WS` | `/ws/angles` | Outbound angle stream for consumers (e.g. Windows app) |
 
-**WebSocket message format:**
+### `/sweep_predict`
+
+Accepts a folder of PNG slices or an explicit ordered file list. Runs batched inference (32 images per forward pass) and returns all slices ranked by confidence:
+
 ```json
-{ "type": "calibrate" }
-{ "type": "angles", "x": 12.5, "y": -3.2 }
+{
+  "folder": "/abs/path/to/braindata"
+}
 ```
+
+Response:
+```json
+{
+  "slices": [
+    { "index": 294, "filename": "frame_...png", "confidence": 0.9987 },
+    ...
+  ]
+}
+```
+
+### `/predict/chunks`
+
+Groups consecutive slices into 3D chunks `[C, D, H, W]` and batches them for a single forward pass per batch. Returns chunks ranked by confidence. Uses a mock model until a real 3D checkpoint is trained and loaded.
+
+```json
+{
+  "folder": "/abs/path/to/braindata",
+  "chunk_size": 16,
+  "stride": 8
+}
+```
+
+### WebSocket — `/ws` (iPhone → server)
+
+```json
+{ "type": "angles", "x": 12.5, "y": -3.2 }
+{ "type": "calibrate" }
+```
+
+### WebSocket — `/ws/angles` (server → consumers)
+
+Pushes `{x, y, updated_at}` to all connected subscribers whenever the probe angle changes. Sends the last known value immediately on connect.
 
 ---
 
@@ -100,24 +129,17 @@ python3 train.py --image_dir images --resume checkpoints/best_model.pt
 ## Repo Structure
 
 ```
-app.py               FastAPI server — serves SPA + all API endpoints
+app.py               FastAPI server — serves UI + all API endpoints
 model.py             EfficientNet regression model
-dataset.py           Denorm utilities
-predict.py           Inference helpers
+dataset.py           Denormalization utilities
+predict.py           Inference helpers (predict_single, predict_batch, predict_3d_chunks)
 main.py              RF → B-mode reconstruction
 settings.py          Probe parameters
 ae2RF.txt            Sample RF data
 requirements.txt     Python dependencies
-src/                 React frontend source
+dist/                Built frontend (served as SPA)
 modelTrain/
   train.py           Two-phase training script
   test_ws.py         WebSocket test client
   checkpoints/       Saved weights + training history
 ```
-
-
-<!-- brew install node mkcert && mkcert -install
-pip3 install -r requirements.txt
-npm install 
-bash start.sh
--->
