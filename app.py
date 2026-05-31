@@ -28,7 +28,6 @@ import argparse
 from datetime import datetime, timezone
 from typing import Optional
 
-import numpy as np
 import uvicorn
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.exceptions import RequestValidationError
@@ -70,6 +69,18 @@ latest_angles: dict = {
 # ── Model registry ────────────────────────────────────────────────────────────
 
 _model_lock = asyncio.Lock()
+_ws_clients: set = set()
+
+
+async def _broadcast(message: dict):
+    """Push a message to every connected WebSocket client."""
+    dead = set()
+    for ws in _ws_clients:
+        try:
+            await ws.send_text(json.dumps(message))
+        except Exception:
+            dead.add(ws)
+    _ws_clients -= dead
 
 # Image model state
 _image_model      = None
@@ -77,11 +88,6 @@ _image_transform  = None
 _image_device     = None
 _image_checkpoint = None   # path of the currently loaded checkpoint
 _image_loaded_at  = None   # ISO timestamp
-
-# RF model state (swap MockRFModel for a real one via POST /model/rf/load)
-_rf_model         = None
-_rf_model_name    = None
-_rf_loaded_at     = None
 
 # 3D chunk model state (None until trained and loaded via POST /model/chunk/load)
 _chunk_model = None
@@ -116,28 +122,6 @@ class SliceResult(BaseModel):
 class SweepPredictResponse(BaseModel):
     slices: list[SliceResult]   # sorted best → worst confidence
 
-class MockRFModel:
-    """Stub RF model — replace with real inference when available."""
-    name = "MockRFModel"
-
-    def predict(self, rf_data: np.ndarray) -> dict:
-        return {
-            "cisterna_magna_detected": bool(np.random.rand() > 0.3),
-            "confidence":             float(np.random.rand()),
-            "depth_mm":               float(np.random.uniform(40, 80)),
-            "tilt_x_deg":             float(np.random.uniform(-15, 15)),
-            "tilt_y_deg":             float(np.random.uniform(-15, 15)),
-            "classification":         "cisterna_magna" if np.random.rand() > 0.4 else "other",
-        }
-
-
-def _init_rf_model():
-    global _rf_model, _rf_model_name, _rf_loaded_at
-    _rf_model      = MockRFModel()
-    _rf_model_name = MockRFModel.name
-    _rf_loaded_at  = datetime.now(timezone.utc).isoformat()
-
-
 def _load_image_model_sync(checkpoint_path: str):
     """Load (or reload) the UltrasoundLocalizer from a checkpoint. Thread-safe caller
     must hold _model_lock before calling this."""
@@ -160,21 +144,6 @@ def _load_image_model_sync(checkpoint_path: str):
 
 
 # ── Request / response schemas ────────────────────────────────────────────────
-
-class PredictRFRequest(BaseModel):
-    rf_data:  list[float]
-    metadata: Optional[dict] = None
-
-
-class PredictRFResponse(BaseModel):
-    cisterna_magna_detected: bool
-    confidence:              float
-    depth_mm:                float
-    tilt_x_deg:              float
-    tilt_y_deg:              float
-    classification:          str
-    timestamp:               str
-
 
 class PredictImageResponse(BaseModel):
     x:         float
@@ -220,11 +189,6 @@ async def model_status():
             "device":     str(_image_device) if _image_device else None,
             "loaded_at":  _image_loaded_at,
         },
-        "rf": {
-            "loaded":     _rf_model is not None,
-            "name":       _rf_model_name,
-            "loaded_at":  _rf_loaded_at,
-        },
     })
 
 
@@ -240,21 +204,6 @@ async def hot_swap_image_model(body: LoadImageModelRequest):
         except Exception as exc:
             raise HTTPException(status_code=500, detail=str(exc))
     return {"status": "ok", "checkpoint": path, "loaded_at": _image_loaded_at}
-
-
-@app.post("/predict/rf", response_model=PredictRFResponse)
-async def predict_rf(payload: PredictRFRequest):
-    if not payload.rf_data:
-        raise HTTPException(status_code=422, detail="rf_data must not be empty.")
-    rf_array = np.array(payload.rf_data, dtype=np.float32)
-    result   = _rf_model.predict(rf_array)
-    return PredictRFResponse(**result, timestamp=datetime.now(timezone.utc).isoformat())
-
-
-@app.post("/predict", response_model=PredictRFResponse)
-async def predict_rf_alias(payload: PredictRFRequest):
-    """Backwards-compatible alias for /predict/rf."""
-    return await predict_rf(payload)
 
 
 @app.post("/predict/image", response_model=PredictImageResponse)
@@ -282,6 +231,7 @@ async def predict_image(image: UploadFile = File(...)):
 
     x = denormalize_x(pred[0:1]).item()
     y = denormalize_y(pred[1:2]).item()
+    await _broadcast({"type": "prediction", "x": round(x, 3), "y": round(y, 3)})
     return PredictImageResponse(x=x, y=y, timestamp=datetime.now(timezone.utc).isoformat())
 
 
@@ -529,6 +479,7 @@ def _angle_snapshot() -> dict:
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
     await ws.accept()
+    _ws_clients.add(ws)
     print(f"[WS] Client connected: {ws.client.host}")
     try:
         while True:
@@ -551,6 +502,8 @@ async def websocket_endpoint(ws: WebSocket):
                 print(f"[WS] Invalid JSON: {raw[:120]}")
     except WebSocketDisconnect:
         print("[WS] Client disconnected")
+    finally:
+        _ws_clients.discard(ws)
 
 
 @app.websocket("/ws/angles")
@@ -599,8 +552,6 @@ if __name__ == "__main__":
     parser.add_argument("--port", type=int, default=int(os.environ.get("PORT", 3000)))
     parser.add_argument("--host", default="0.0.0.0")
     args = parser.parse_args()
-
-    _init_rf_model()
 
     if args.checkpoint:
         _load_image_model_sync(args.checkpoint)

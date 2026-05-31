@@ -31,6 +31,9 @@ htmlcov/
 *.pem
 *.key
 
+# Data collection
+5-2-2026 data collection/
+
 # Editor / OS
 .vscode/*
 !.vscode/extensions.json
