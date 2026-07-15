@@ -434,6 +434,7 @@ async def rf_convert(
     lines: Optional[int] = None,
     samples: Optional[int] = None,
     fast: int = 1,
+    signed: int = 1,
     center_freq: Optional[float] = None,
     fractional_bw: Optional[float] = None,
     sector_angle_deg: Optional[float] = None,
@@ -446,7 +447,13 @@ async def rf_convert(
 
       * Binary (used by the Windows app — fast, no disk):
             POST /rf/convert?lines=127&samples=2048&fast=1
-            body = raw little-endian uint16 samples, row-major (line, sample).
+            body = raw little-endian int16 samples, row-major (line, sample).
+            The probe RF is SIGNED (zero-centred): the Windows buffer is a
+            ushort[,] but the true value is (short)buf[i,j], and the reference
+            captures (ae2RF.txt) contain negative values. `signed=1` (default)
+            reads the bytes as '<i2'; pass signed=0 only for genuinely unsigned
+            data. Misreading signed RF as unsigned turns every negative sample
+            into a large positive one, which is the main source of noise.
 
       * Multipart CSV (replay / testing):
             POST /rf/convert  with form field `file` = a *RF.csv capture.
@@ -485,7 +492,10 @@ async def rf_convert(
         if lines is None or samples is None:
             raise HTTPException(status_code=422,
                                 detail="Binary mode requires 'lines' and 'samples' query params.")
-        arr = np.frombuffer(body, dtype="<u2")
+        # Probe RF is signed 16-bit by default (see docstring); '<i2' keeps the
+        # zero-centred waveform intact. signed=0 falls back to unsigned '<u2'.
+        dtype = "<i2" if signed else "<u2"
+        arr = np.frombuffer(body, dtype=dtype)
         expected = lines * samples
         if arr.size < expected:
             raise HTTPException(status_code=422,
