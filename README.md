@@ -49,6 +49,7 @@ Both devices must be on the **same Wi-Fi network**. HTTPS is required — browse
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | `GET` | `/angles` | Latest IMU probe angles |
+| `POST` | `/rf/convert` | Raw RF frame → convex B-mode PNG (real-time) |
 | `GET` | `/model/status` | Show loaded model and metadata |
 | `POST` | `/model/image/load` | Hot-swap image checkpoint at runtime |
 | `POST` | `/predict/image` | Single-image inference — returns `(x, y)` tilt in degrees |
@@ -112,6 +113,30 @@ python3 main.py
 ```
 
 Input: `ae2RF.txt` — Output: `Fixed_Convex_B-mode_Reconstruction.png` + heatmap. Probe settings in `settings.py`.
+
+### `/rf/convert` — real-time RF → B-mode
+
+Converts a single RF frame and returns an 8-bit grayscale convex B-mode PNG. The
+Windows app calls this per captured frame to drive the live 2D + 3D views.
+
+Two input modes (auto-detected from `Content-Type`):
+
+- **Binary** (used by the app — fast, no disk):
+  `POST /rf/convert?lines=127&samples=2048&fast=1` with the body set to the raw
+  little-endian `uint16` samples, row-major `(line, sample)`.
+- **Multipart CSV** (replay / testing): `POST /rf/convert` with form field `file`
+  set to a captured `*RF.csv`. The header row and leading `Line` index column are
+  stripped automatically.
+
+Optional query params (`center_freq`, `fractional_bw`, `sector_angle_deg`,
+`curvature_radius_mm`) override the probe geometry; defaults come from `settings.py`.
+`fast=1` (default) skips the slow anisotropic-diffusion pass for low latency.
+
+```bash
+# Replay an existing capture:
+curl -k -X POST -F "file=@braindata/frame_..._rawRF.csv" \
+     https://localhost:3000/rf/convert -o recon.png
+```
 
 ---
 

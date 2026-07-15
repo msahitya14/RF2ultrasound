@@ -9,6 +9,7 @@ Usage:
 
 Endpoints:
     GET  /angles              latest probe IMU angles
+    POST /rf/convert          raw RF frame -> convex B-mode PNG (binary or CSV)
     POST /predict/rf          RF data inference
     POST /predict/image       image localization (needs a loaded checkpoint)
     POST /predict             backwards-compat alias for /predict/rf
@@ -31,7 +32,7 @@ from typing import Optional
 import uvicorn
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from PIL import Image
 from pydantic import BaseModel
@@ -423,6 +424,103 @@ async def load_chunk_model(body: LoadImageModelRequest):
     """
     raise HTTPException(status_code=501,
                         detail="3D model class not yet defined — train one first.")
+
+
+# ── RF → B-mode reconstruction ────────────────────────────────────────────────
+
+@app.post("/rf/convert")
+async def rf_convert(
+    request: Request,
+    lines: Optional[int] = None,
+    samples: Optional[int] = None,
+    fast: int = 1,
+    signed: int = 1,
+    center_freq: Optional[float] = None,
+    fractional_bw: Optional[float] = None,
+    sector_angle_deg: Optional[float] = None,
+    curvature_radius_mm: Optional[float] = None,
+):
+    """
+    Convert one raw RF frame into a convex B-mode image (8-bit grayscale PNG).
+
+    Two input modes (auto-detected from Content-Type):
+
+      * Binary (used by the Windows app — fast, no disk):
+            POST /rf/convert?lines=127&samples=2048&fast=1
+            body = raw little-endian int16 samples, row-major (line, sample).
+            The probe RF is SIGNED (zero-centred): the Windows buffer is a
+            ushort[,] but the true value is (short)buf[i,j], and the reference
+            captures (ae2RF.txt) contain negative values. `signed=1` (default)
+            reads the bytes as '<i2'; pass signed=0 only for genuinely unsigned
+            data. Misreading signed RF as unsigned turns every negative sample
+            into a large positive one, which is the main source of noise.
+
+      * Multipart CSV (replay / testing):
+            POST /rf/convert  with form field `file` = a *RF.csv capture.
+            The header row and leading `Line` index column are stripped.
+
+    Optional query params override the probe geometry (defaults from settings.py
+    via main.reconstruct_bmode_array).  `fast=1` skips the slow diffusion pass.
+    """
+    import numpy as np
+    import cv2
+    import os
+    import tempfile
+    from main import reconstruct_bmode_array, load_rf_csv
+
+    content_type = request.headers.get("content-type", "")
+
+    # ── Resolve the RF array from whichever input mode the client used ─────────
+    if content_type.startswith("multipart/form-data"):
+        form = await request.form()
+        upload = form.get("file")
+        if upload is None:
+            raise HTTPException(status_code=422, detail="multipart request missing 'file' field.")
+        raw = await upload.read()
+        tmp = tempfile.NamedTemporaryFile(suffix=".csv", delete=False)
+        try:
+            tmp.write(raw)
+            tmp.close()
+            data = load_rf_csv(tmp.name)
+        finally:
+            os.unlink(tmp.name)
+    else:
+        body = await request.body()
+        if not body:
+            raise HTTPException(status_code=422,
+                                detail="Empty body. Send raw uint16 RF data or a multipart 'file'.")
+        if lines is None or samples is None:
+            raise HTTPException(status_code=422,
+                                detail="Binary mode requires 'lines' and 'samples' query params.")
+        # Probe RF is signed 16-bit by default (see docstring); '<i2' keeps the
+        # zero-centred waveform intact. signed=0 falls back to unsigned '<u2'.
+        dtype = "<i2" if signed else "<u2"
+        arr = np.frombuffer(body, dtype=dtype)
+        expected = lines * samples
+        if arr.size < expected:
+            raise HTTPException(status_code=422,
+                                detail=f"RF body has {arr.size} samples; expected lines*samples={expected}.")
+        data = arr[:expected].reshape(lines, samples).astype(np.float64)
+
+    # ── Optional probe-geometry overrides ─────────────────────────────────────
+    kw = {}
+    for name, val in (("center_freq", center_freq),
+                      ("fractional_bw", fractional_bw),
+                      ("sector_angle_deg", sector_angle_deg),
+                      ("curvature_radius_mm", curvature_radius_mm)):
+        if val is not None:
+            kw[name] = val
+
+    try:
+        img8 = reconstruct_bmode_array(data, fast=bool(fast), **kw)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"RF reconstruction failed: {exc}")
+
+    ok, png = cv2.imencode(".png", img8)
+    if not ok:
+        raise HTTPException(status_code=500, detail="PNG encoding failed.")
+    return Response(content=png.tobytes(), media_type="image/png")
+
 
 # ── WebSocket ─────────────────────────────────────────────────────────────────
 

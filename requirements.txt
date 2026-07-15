@@ -11,4 +11,5 @@ opencv-python
 matplotlib
 
 # ML inference (optional — only needed with --checkpoint)
-# torch torchvision
+torch 
+torchvision
