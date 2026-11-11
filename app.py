@@ -76,12 +76,15 @@ _ws_clients: set = set()
 async def _broadcast(message: dict):
     """Push a message to every connected WebSocket client."""
     dead = set()
-    for ws in _ws_clients:
+    # iterate a snapshot: a client can connect/disconnect during the awaits below
+    for ws in list(_ws_clients):
         try:
             await ws.send_text(json.dumps(message))
         except Exception:
             dead.add(ws)
-    _ws_clients -= dead
+    # in-place update: `_ws_clients -= dead` would make the name local to this
+    # function and raise UnboundLocalError on the loop above
+    _ws_clients.difference_update(dead)
 
 # Image model state
 _image_model      = None
